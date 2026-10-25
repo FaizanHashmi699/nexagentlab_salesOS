@@ -1,0 +1,16 @@
+business_name,contact_name,email,website,phone,location,source,notes
+Sunrise Bakery,Maria Johnson,maria@sunrisebakery-test.com,sunrisebakery-test.com,555-0101,"Austin, TX",linkedin,Family bakery established 15 years
+TechFix Solutions,James Chen,james@techfix-test.com,techfix-test.com,555-0102,"Denver, CO",referral,IT repair and managed services
+Green Valley Landscaping,Robert Garcia,robert@greenvalley-test.com,greenvalley-test.com,555-0103,"Portland, OR",cold_list,Residential and commercial landscaping
+Bella Salon & Spa,Sophia Martinez,sophia@bellasalon-test.com,bellasalon-test.com,555-0104,"Miami, FL",google_maps,High-end salon and day spa
+Mountain View Dental,Dr. Emily White,emily@mtviewdental-test.com,mtviewdental-test.com,555-0105,"Seattle, WA",linkedin,3 dentists on staff
+Swift Auto Repair,Michael Brown,michael@swiftauto-test.com,swiftauto-test.com,555-0106,"Chicago, IL",cold_list,Full-service automotive repair
+Oceanside Realty,Amanda Wilson,amanda@oceanside-test.com,oceanside-test.com,555-0107,"San Diego, CA",referral,Boutique real estate agency
+FreshFit Gym,Tyler Davis,tyler@freshfit-test.com,freshfit-test.com,555-0108,"Nashville, TN",google_maps,Boutique fitness studio
+Cozy Paws Pet Care,Jasmine Lee,jasmine@cozypaws-test.com,cozypaws-test.com,555-0109,"Boston, MA",cold_list,Pet grooming and boarding
+Elite Legal Group,David Robinson,david@elitelegal-test.com,elitelegal-test.com,555-0110,"Houston, TX",linkedin,Small business law firm
+Sunrise Bakery,Maria Johnson,maria@sunrisebakery-test.com,sunrisebakery-test.com,555-0101,"Austin, TX",web_scrape,Duplicate entry for dedup testing
+Pixel Perfect Design,Karen Thompson,karen@pixelperfect-test.com,pixelperfect-test.com,555-0111,"San Francisco, CA",referral,Graphic design studio
+,,invalid-email,,,,,Invalid row for error handling test
+Healthy Bites Catering,Lisa Anderson,lisa@healthybites-test.com,healthybites-test.com,555-0112,"Atlanta, GA",google_maps,Corporate and event catering
+Prime Plumbing Co,Mark Taylor,mark@primeplumbing-test.com,primeplumbing-test.com,555-0113,"Phoenix, AZ",cold_list,Emergency and residential plumbing
