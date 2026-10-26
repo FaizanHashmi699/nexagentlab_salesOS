@@ -8,7 +8,7 @@
 
 🟢 **Milestone 1** — Lead import, validation, deduplication, and CLI  
 🟢 **Milestone 2** — Research Agent & Opportunity Identification  
-⬜ Milestone 3 — Personalization & quality agents  
+🟢 **Milestone 3** — Lead Qualification, Service Matching & Personalization  
 ⬜ Milestone 4 — Email integration (Gmail API)  
 ⬜ Milestone 5 — Reply management & sales pipeline  
 ⬜ Milestone 6 — Dashboard & campaign management  
@@ -86,10 +86,45 @@ salesos research export data\exports\research_summary.csv
 salesos research export data\exports\research_summary.json --format json
 ```
 
-### 5. Run Tests
+### 5. Qualify Leads & Match Services
+
+```powershell
+# Run qualification scoring on all eligible researched leads
+salesos qualify run
+
+# Run qualification with custom batch size or minimum score threshold
+salesos qualify run --limit 20 --min-score 50
+
+# Inspect qualification breakdown and explainable scoring for a lead
+salesos qualify show 1
+```
+
+### 6. Generate Personalized Outreach Drafts
+
+```powershell
+# Generate personalized email drafts for qualified leads (template fallback if no API key)
+salesos personalize run
+
+# Generate draft for a specific lead or enforce a minimum score
+salesos personalize run --lead-id 1
+salesos personalize run --limit 10 --min-score 60
+
+# List stored email drafts and review their Quality Gate status
+salesos drafts list
+
+# Inspect a generated draft with validation report and service match
+salesos drafts show 1
+
+# Export approved drafts to CSV or JSON for review
+salesos drafts export data\exports\outreach_drafts.csv
+salesos drafts export data\exports\outreach_drafts.json --format json
+```
+
+### 7. Run Tests
 
 ```powershell
 pytest tests/ -v
+# Total tests: 114 passed
 ```
 
 ## Architecture
@@ -129,7 +164,13 @@ Copy `.env.example` to `.env` and fill in values as needed:
 copy .env.example .env
 ```
 
-No API keys are required for Milestone 1 (lead import & management).
+### Free AI Provider Options (Zero Required Spending)
+The system works out-of-the-box with high-quality deterministic email generation templates if no API key is provided. To enable LLM-generated personalization, set one of the following free-tier keys:
+- **GroqCloud (Recommended free-tier speed & limits)**: Set `GROQ_API_KEY` (uses `llama-3.3-70b-versatile` or `llama-3.1-8b-instant`).
+- **Google Gemini**: Set `GEMINI_API_KEY` or `GOOGLE_API_KEY` (uses `gemini-1.5-flash`).
+- **OpenRouter**: Set `OPENROUTER_API_KEY` (uses `meta-llama/llama-3.3-70b-instruct:free`).
+
+Rate limiting, backoff, and prompt-injection sanitization are built-in.
 
 ## Safety Rules
 

@@ -29,6 +29,18 @@ from .researcher import (
     run_research_batch,
 )
 from .ai_provider import get_provider_status
+from .qualifier import (
+    get_lead_qualification,
+    get_qualification_status,
+    qualify_lead,
+    run_qualification_batch,
+)
+from .personalizer import (
+    export_drafts,
+    get_drafts,
+    personalize_lead,
+    run_personalization_batch,
+)
 
 # Force UTF-8 to avoid cp1252 encoding errors with Rich on Windows
 import sys
@@ -655,6 +667,234 @@ def research_export_cmd(output: str, fmt: str, lead_id: int | None):
                     })
 
         console.print(f"[green]✓ Exported {len(exported_data)} research records to {output}[/green]")
+    finally:
+        conn.close()
+
+
+# ── Qualification subcommands ────────────────────────────────────────
+
+@cli.group("qualify")
+def qualify_group():
+    """Lead qualification and fit scoring commands."""
+
+
+@qualify_group.command("run")
+@click.option("--limit", default=50, help="Max leads to qualify in this batch")
+@click.option("--force", is_flag=True, help="Re-qualify leads even if already scored")
+def qualify_run_cmd(limit: int, force: bool):
+    """Run qualification and scoring on eligible leads."""
+    conn = _get_conn()
+    try:
+        console.print(f"Starting lead qualification batch (limit={limit}, force={force})...")
+        summary = run_qualification_batch(conn, limit=limit, force=force)
+
+        console.print(
+            Panel(
+                f"[bold]Total processed:[/bold] {summary.total}\n"
+                f"[bold green]Qualified (score >= 45):[/bold green] {summary.qualified}\n"
+                f"[bold yellow]Unqualified (score < 45):[/bold yellow] {summary.unqualified}\n"
+                f"[bold red]Suppressed / Opt-out:[/bold red] {summary.suppressed}\n"
+                f"[bold]Skipped on error:[/bold] {summary.skipped}\n"
+                f"[bold]Duration:[/bold] {summary.duration_seconds}s",
+                title="Lead Qualification Summary",
+                border_style="green" if summary.qualified > 0 else "yellow",
+            )
+        )
+    finally:
+        conn.close()
+
+
+@qualify_group.command("show")
+@click.argument("lead_id", type=int)
+def qualify_show_cmd(lead_id: int):
+    """Show detailed qualification breakdown and explanation for a lead."""
+    conn = _get_conn()
+    try:
+        lead = conn.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
+        if not lead:
+            console.print(f"[red]Lead ID #{lead_id} not found.[/red]")
+            return
+
+        # Calculate or fetch qualification
+        res = qualify_lead(lead, conn)
+
+        score_color = "green" if res.score >= 70 else "yellow" if res.score >= 45 else "red"
+        console.print(
+            Panel(
+                f"[bold]Lead:[/bold] #{res.lead_id} — {res.business_name} ({res.email})\n"
+                f"[bold]Score:[/bold] [{score_color}]{res.score:.1f} / 100[/{score_color}] "
+                f"([bold {score_color}]{res.priority.upper()}[/bold {score_color}])\n"
+                f"[bold]Eligible for Outreach:[/bold] {'[green]Yes[/green]' if res.eligible else '[red]No[/red]'}\n"
+                f"[bold]Confidence:[/bold] {res.confidence * 100:.0f}%\n"
+                f"[bold]Recommended Action:[/bold] {res.recommended_action}\n"
+                f"[bold]Scoring Version:[/bold] {res.scoring_version}",
+                title=f"Qualification: {res.business_name}",
+                border_style=score_color,
+            )
+        )
+
+        if res.explanation:
+            table = Table(title="Scoring Breakdown & Audit Trail", box=box.SIMPLE)
+            table.add_column("Explanation / Point Allocation", style="cyan")
+            for item in res.explanation:
+                style = "green" if item.startswith("+") and not item.startswith("+0") else "red" if item.startswith("-") else "dim"
+                table.add_row(f"[{style}]{item}[/{style}]")
+            console.print(table)
+    finally:
+        conn.close()
+
+
+# ── Personalization subcommands ──────────────────────────────────────
+
+@cli.group("personalize")
+def personalize_group():
+    """Personalized email generation commands."""
+
+
+@personalize_group.command("run")
+@click.option("--limit", default=20, help="Max leads to draft emails for")
+@click.option("--force", is_flag=True, help="Re-generate drafts for leads with existing messages")
+@click.option("--use-ai/--no-ai", default=True, help="Enable/disable hosted AI provider for drafting")
+def personalize_run_cmd(limit: int, force: bool, use_ai: bool):
+    """Generate personalized outreach drafts for qualified leads."""
+    conn = _get_conn()
+    try:
+        provider_info = get_provider_status() if use_ai else None
+        provider_label = f"{provider_info.provider} ({provider_info.model})" if (provider_info and provider_info.available) else "template engine"
+        console.print(f"Starting email personalization (limit={limit}, force={force}, engine={provider_label})...")
+
+        summary = run_personalization_batch(conn, limit=limit, use_ai=use_ai, force=force)
+
+        console.print(
+            Panel(
+                f"[bold]Total processed:[/bold] {summary.total}\n"
+                f"[bold green]Approved by Quality Gate:[/bold green] {summary.approved}\n"
+                f"[bold red]Rejected by Quality Gate:[/bold red] {summary.rejected}\n"
+                f"[bold]Skipped / Existed:[/bold] {summary.skipped}\n"
+                f"[bold]Duration:[/bold] {summary.duration_seconds}s",
+                title="Personalization Run Summary",
+                border_style="green" if summary.approved > 0 else "yellow",
+            )
+        )
+    finally:
+        conn.close()
+
+
+# ── Drafts subcommands ───────────────────────────────────────────────
+
+@cli.group("drafts")
+def drafts_group():
+    """Draft message inspection and export commands."""
+
+
+@drafts_group.command("list")
+@click.option("--status", "status_filter", default="all", type=click.Choice(["all", "approved", "rejected", "pending"]), help="Filter by quality status")
+@click.option("--limit", default=50, help="Max drafts to show")
+def drafts_list_cmd(status_filter: str, limit: int):
+    """List generated email drafts."""
+    conn = _get_conn()
+    try:
+        drafts = get_drafts(conn, status_filter=status_filter, limit=limit)
+        if not drafts:
+            console.print("[yellow]No drafts found matching criteria.[/yellow]")
+            return
+
+        table = Table(title=f"Email Drafts ({len(drafts)} shown)", box=box.ROUNDED)
+        table.add_column("ID", style="dim", width=4)
+        table.add_column("Lead", style="bold")
+        table.add_column("Recipient", style="cyan")
+        table.add_column("Subject")
+        table.add_column("Service", style="green")
+        table.add_column("Engine")
+        table.add_column("Quality", justify="center")
+
+        for d in drafts:
+            q_style = "green" if d.get("quality_status") == "approved" else "red"
+            table.add_row(
+                str(d["id"]),
+                d.get("business_name", ""),
+                d.get("recipient", ""),
+                (d.get("subject", "") or "")[:40] + ("..." if len(d.get("subject", "") or "") > 40 else ""),
+                d.get("selected_service", ""),
+                d.get("provider", "template"),
+                f"[{q_style}]{d.get('quality_status', 'draft')}[/{q_style}]",
+            )
+        console.print(table)
+    finally:
+        conn.close()
+
+
+@drafts_group.command("show")
+@click.argument("draft_id", type=int)
+def drafts_show_cmd(draft_id: int):
+    """Display full email draft contents and quality inspection report."""
+    conn = _get_conn()
+    try:
+        # Check by draft ID or lead ID
+        row = conn.execute(
+            """SELECT m.*, l.business_name, l.contact_name, l.website, l.location
+               FROM messages m
+               JOIN leads l ON l.id = m.lead_id
+               WHERE m.id = ? OR m.lead_id = ?
+               ORDER BY m.id DESC LIMIT 1""",
+            (draft_id, draft_id),
+        ).fetchone()
+
+        if not row:
+            console.print(f"[red]No draft found with ID or Lead ID #{draft_id}.[/red]")
+            return
+
+        d = dict(row)
+        q_status = d.get("quality_status", "pending")
+        border = "green" if q_status == "approved" else "red"
+
+        console.print(
+            Panel(
+                f"[bold]Draft ID:[/bold] {d['id']}  |  [bold]Lead ID:[/bold] {d['lead_id']}\n"
+                f"[bold]Business:[/bold] {d['business_name']} ({d['website'] or 'No website'})\n"
+                f"[bold]To:[/bold] {d.get('recipient', '')}\n"
+                f"[bold]Service Focus:[/bold] {d.get('selected_service', '')} (Score: {d.get('qualification_score', 0):.1f})\n"
+                f"[bold]Generator Engine:[/bold] {d.get('provider', 'template')} ({d.get('model') or 'rules'})\n"
+                f"[bold]Quality Status:[/bold] [{border}]{q_status.upper()}[/{border}]\n"
+                f"[dim]Created: {d.get('created_at', '')}[/dim]",
+                title="Email Draft Metadata",
+                border_style=border,
+            )
+        )
+
+        console.print(
+            Panel(
+                f"[bold]Subject:[/bold] {d.get('subject', '')}\n\n"
+                f"{d.get('body', '')}",
+                title="Email Message Preview",
+                border_style="cyan",
+            )
+        )
+
+        errors = json.loads(d["validation_errors"]) if d.get("validation_errors") else []
+        if errors:
+            console.print("[red]Quality Gate Rejection Reasons:[/red]")
+            for err in errors:
+                console.print(f"  • [red]{err}[/red]")
+        elif q_status == "approved":
+            console.print("[green]✓ Draft passed all Quality Gate checks and is ready for outreach.[/green]")
+    finally:
+        conn.close()
+
+
+@drafts_group.command("export")
+@click.argument("output", type=click.Path())
+@click.option("--format", "fmt", default="csv", type=click.Choice(["csv", "json"]), help="Output format")
+@click.option("--status", "status_filter", default="all", type=click.Choice(["all", "approved", "rejected"]), help="Filter by quality status")
+def drafts_export_cmd(output: str, fmt: str, status_filter: str):
+    """Export generated drafts to a CSV or JSON file."""
+    conn = _get_conn()
+    try:
+        count = export_drafts(conn, output_path=output, fmt=fmt, status_filter=status_filter)
+        if count == 0:
+            console.print("[yellow]No drafts found matching the export filter.[/yellow]")
+        else:
+            console.print(f"[green]✓ Exported {count} drafts to {output}[/green]")
     finally:
         conn.close()
 

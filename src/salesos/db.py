@@ -118,12 +118,21 @@ CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     lead_id INTEGER NOT NULL REFERENCES leads(id),
     campaign_id INTEGER REFERENCES campaigns(id),
+    recipient TEXT,
     subject TEXT,
     body TEXT,
     message_type TEXT DEFAULT 'initial'
         CHECK (message_type IN ('initial', 'follow_up', 'reply')),
     status TEXT DEFAULT 'draft'
         CHECK (status IN ('draft', 'queued', 'approved', 'sent', 'failed', 'bounced', 'cancelled')),
+    quality_status TEXT DEFAULT 'pending'
+        CHECK (quality_status IN ('pending', 'approved', 'rejected', 'manual_review')),
+    selected_service TEXT,
+    qualification_score REAL,
+    evidence_references TEXT,
+    provider TEXT,
+    model TEXT,
+    validation_errors TEXT,
     attempt_count INTEGER DEFAULT 0,
     max_attempts INTEGER DEFAULT 3,
     scheduled_at TEXT,
@@ -231,6 +240,29 @@ def transaction(conn: sqlite3.Connection):
         raise
 
 
+def _migrate_db(conn: sqlite3.Connection) -> None:
+    """Migrate existing tables to add new optional columns if missing."""
+    cursor = conn.execute("PRAGMA table_info(messages)")
+    columns = {row["name"] for row in cursor.fetchall()}
+
+    migrations = [
+        ("recipient", "ALTER TABLE messages ADD COLUMN recipient TEXT"),
+        ("quality_status", "ALTER TABLE messages ADD COLUMN quality_status TEXT DEFAULT 'pending'"),
+        ("selected_service", "ALTER TABLE messages ADD COLUMN selected_service TEXT"),
+        ("qualification_score", "ALTER TABLE messages ADD COLUMN qualification_score REAL"),
+        ("evidence_references", "ALTER TABLE messages ADD COLUMN evidence_references TEXT"),
+        ("provider", "ALTER TABLE messages ADD COLUMN provider TEXT"),
+        ("model", "ALTER TABLE messages ADD COLUMN model TEXT"),
+        ("validation_errors", "ALTER TABLE messages ADD COLUMN validation_errors TEXT"),
+    ]
+    for col_name, sql in migrations:
+        if col_name not in columns:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass
+
+
 def init_db(db_path: str | None = None) -> sqlite3.Connection:
     """Initialize the database with the full schema.
 
@@ -238,6 +270,7 @@ def init_db(db_path: str | None = None) -> sqlite3.Connection:
     """
     conn = get_connection(db_path)
     conn.executescript(SCHEMA)
+    _migrate_db(conn)
     conn.commit()
     return conn
 
