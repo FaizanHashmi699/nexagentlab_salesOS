@@ -7,7 +7,7 @@
 ## Status
 
 🟢 **Milestone 1** — Lead import, validation, deduplication, and CLI  
-⬜ Milestone 2 — Research & opportunity agents  
+🟢 **Milestone 2** — Research Agent & Opportunity Identification  
 ⬜ Milestone 3 — Personalization & quality agents  
 ⬜ Milestone 4 — Email integration (Gmail API)  
 ⬜ Milestone 5 — Reply management & sales pipeline  
@@ -62,7 +62,31 @@ salesos export output.csv
 salesos export output.json --format json
 ```
 
-### 4. Run Tests
+### 4. Research Leads & Identify Opportunities
+
+```powershell
+# Preview research extraction for a URL or lead ID (read-only, no database write)
+salesos research preview https://example.com
+salesos research preview 1
+
+# Check aggregate research status and AI provider availability
+salesos research status
+
+# Run research on eligible imported leads (batch limit configurable)
+salesos research run --limit 10
+
+# Force re-run research for a specific lead ID
+salesos research run --lead-id 1 --force
+
+# Retry leads whose previous research attempt failed
+salesos research retry --limit 20
+
+# Export research findings and opportunities to CSV or JSON
+salesos research export data\exports\research_summary.csv
+salesos research export data\exports\research_summary.json --format json
+```
+
+### 5. Run Tests
 
 ```powershell
 pytest tests/ -v

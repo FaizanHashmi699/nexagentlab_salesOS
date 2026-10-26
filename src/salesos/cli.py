@@ -19,6 +19,16 @@ from rich.table import Table
 
 from .db import get_connection, get_db_path, init_db
 from .importer import ImportResult, import_leads, preview_import
+from .researcher import (
+    extract_evidence,
+    fetch_page,
+    get_lead_research,
+    get_research_status,
+    identify_opportunities,
+    retry_failed_research,
+    run_research_batch,
+)
+from .ai_provider import get_provider_status
 
 # Force UTF-8 to avoid cp1252 encoding errors with Rich on Windows
 import sys
@@ -266,6 +276,10 @@ def export(output: str, status: str | None, fmt: str):
 
         columns = rows[0].keys()
 
+        out_dir = os.path.dirname(os.path.abspath(output))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
         if fmt == "csv":
             with open(output, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=columns)
@@ -377,6 +391,272 @@ def _print_import_result(result: ImportResult, dry_run: bool = False) -> None:
         console.print(f"\n[red]Errors ({len(result.error_details)}):[/red]")
         for e in result.error_details[:10]:
             console.print(f"  • Row {e['row']}: {', '.join(e['errors'])}")
+
+
+# ── Research subcommands ─────────────────────────────────────────────
+
+@cli.group("research")
+def research_group():
+    """Website research and opportunity identification commands."""
+
+
+@research_group.command("preview")
+@click.argument("target")
+def research_preview_cmd(target: str):
+    """Preview research extraction on a URL or lead ID without saving.
+
+    TARGET can be a URL (e.g. https://example.com) or an integer Lead ID.
+    """
+    website_url = None
+    biz_name = "Target Website"
+
+    if target.isdigit():
+        conn = _get_conn()
+        try:
+            lead = conn.execute(
+                "SELECT id, business_name, website FROM leads WHERE id = ?",
+                (int(target),),
+            ).fetchone()
+            if not lead:
+                console.print(f"[red]Lead ID {target} not found.[/red]")
+                return
+            if not lead["website"]:
+                console.print(f"[yellow]Lead #{target} ({lead['business_name']}) has no website.[/yellow]")
+                return
+            website_url = lead["website"]
+            biz_name = lead["business_name"]
+        finally:
+            conn.close()
+    else:
+        website_url = target
+        if not website_url.startswith(("http://", "https://")):
+            website_url = "https://" + website_url
+
+    console.print(f"[cyan]Fetching and analyzing [bold]{website_url}[/bold]...[/cyan]")
+    html, final_url, status_code, err = fetch_page(website_url)
+
+    if err or not html:
+        console.print(f"[red]Failed to fetch website:[/red] {err}")
+        return
+
+    evidence = extract_evidence(html, final_url or website_url)
+    opportunities = identify_opportunities(evidence)
+
+    # Display evidence panel
+    console.print(
+        Panel(
+            f"[bold]Target:[/bold] {biz_name}\n"
+            f"[bold]URL:[/bold] {final_url or website_url}\n"
+            f"[bold]Title:[/bold] {evidence.title or '[dim]None[/dim]'}\n"
+            f"[bold]Meta Description:[/bold] {evidence.meta_description or '[dim]None[/dim]'}\n"
+            f"[bold]Headings Found:[/bold] {len(evidence.headings)}\n"
+            f"[bold]Lead Form:[/bold] {'[green]Yes[/green]' if evidence.has_lead_form else '[yellow]No[/yellow]'}  "
+            f"[bold]Booking System:[/bold] {'[green]Yes[/green]' if evidence.has_booking else '[yellow]No[/yellow]'}  "
+            f"[bold]WhatsApp:[/bold] {'[green]Yes[/green]' if evidence.has_whatsapp else '[yellow]No[/yellow]'}  "
+            f"[bold]Chat Widget:[/bold] {'[green]Yes[/green]' if evidence.has_chat_widget else '[yellow]No[/yellow]'}\n"
+            f"[bold]Technologies:[/bold] {', '.join(evidence.technologies_detected) or '[dim]None detected[/dim]'}",
+            title="Website Evidence Preview",
+            border_style="cyan",
+        )
+    )
+
+    if opportunities:
+        table = Table(title=f"Identified Opportunities ({len(opportunities)})", box=box.ROUNDED)
+        table.add_column("Category", style="cyan")
+        table.add_column("Confidence", justify="right")
+        table.add_column("Label")
+        table.add_column("Priority", justify="right", style="bold")
+        table.add_column("Description")
+
+        for opp in opportunities:
+            conf_style = "green" if opp.confidence >= 0.8 else "yellow" if opp.confidence >= 0.6 else "dim"
+            table.add_row(
+                opp.category,
+                f"[{conf_style}]{opp.confidence:.2f}[/{conf_style}]",
+                f"[{conf_style}]{opp.confidence_label}[/{conf_style}]",
+                str(opp.priority),
+                opp.description,
+            )
+        console.print(table)
+    else:
+        console.print("[green]No high-confidence opportunity gaps found.[/green]")
+
+
+@research_group.command("run")
+@click.option("--limit", default=50, help="Max leads to research in this batch")
+@click.option("--lead-id", type=int, default=None, help="Research a specific lead ID")
+@click.option("--force", is_flag=True, help="Re-run research even if already completed")
+def research_run_cmd(limit: int, lead_id: int | None, force: bool):
+    """Run research on eligible leads."""
+    conn = _get_conn()
+    try:
+        lead_ids = [lead_id] if lead_id else None
+        if lead_id:
+            console.print(f"Researching lead [bold]#{lead_id}[/bold]...")
+        else:
+            console.print(f"Starting research batch (limit={limit}, force={force})...")
+
+        summary = run_research_batch(conn, limit=limit, lead_ids=lead_ids, force=force)
+
+        console.print(
+            Panel(
+                f"[bold]Total processed:[/bold] {summary.total}\n"
+                f"[bold green]Completed:[/bold green] {summary.completed}\n"
+                f"[bold cyan]No Website:[/bold cyan] {summary.no_website}\n"
+                f"[bold red]Failed:[/bold red] {summary.failed}\n"
+                f"[bold yellow]Skipped:[/bold yellow] {summary.skipped}\n"
+                f"[bold]Duration:[/bold] {summary.duration_seconds}s",
+                title="Research Run Summary",
+                border_style="green" if summary.failed == 0 else "yellow",
+            )
+        )
+    finally:
+        conn.close()
+
+
+@research_group.command("status")
+def research_status_cmd():
+    """Show aggregate research status and AI provider information."""
+    conn = _get_conn()
+    try:
+        counts = get_research_status(conn)
+        total_leads = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+        researched_leads = conn.execute(
+            "SELECT COUNT(DISTINCT lead_id) FROM research WHERE status = 'completed'"
+        ).fetchone()[0]
+        opp_count = conn.execute("SELECT COUNT(*) FROM opportunities").fetchone()[0]
+
+        ai_status = get_provider_status()
+
+        console.print(
+            Panel(
+                f"[bold]Total Leads:[/bold] {total_leads}\n"
+                f"[bold green]Successfully Researched:[/bold green] {researched_leads}\n"
+                f"[bold]Total Opportunities Identified:[/bold] {opp_count}\n"
+                f"[bold]AI Provider:[/bold] {ai_status.provider} "
+                f"({'[green]Available: ' + str(ai_status.model) + '[/green]' if ai_status.available else '[yellow]Unavailable (' + str(ai_status.reason) + ')[/yellow]'})\n",
+                title="Research Status",
+                border_style="blue",
+            )
+        )
+
+        if counts:
+            table = Table(title="Research Status Breakdown", box=box.SIMPLE)
+            table.add_column("Status", style="cyan")
+            table.add_column("Count", style="bold", justify="right")
+            for status, cnt in counts.items():
+                table.add_row(status, str(cnt))
+            console.print(table)
+    finally:
+        conn.close()
+
+
+@research_group.command("retry")
+@click.option("--limit", default=20, help="Max failed leads to retry")
+def research_retry_cmd(limit: int):
+    """Retry research on leads that previously failed."""
+    conn = _get_conn()
+    try:
+        console.print(f"Retrying failed research (limit={limit})...")
+        summary = retry_failed_research(conn, limit=limit)
+
+        console.print(
+            Panel(
+                f"[bold]Retried:[/bold] {summary.total}\n"
+                f"[bold green]Succeeded:[/bold green] {summary.completed}\n"
+                f"[bold red]Still Failed:[/bold red] {summary.failed}\n"
+                f"[bold]Duration:[/bold] {summary.duration_seconds}s",
+                title="Research Retry Summary",
+                border_style="green" if summary.failed == 0 else "yellow",
+            )
+        )
+    finally:
+        conn.close()
+
+
+@research_group.command("export")
+@click.argument("output", type=click.Path())
+@click.option("--format", "fmt", default="csv", type=click.Choice(["csv", "json"]), help="Output format")
+@click.option("--lead-id", type=int, default=None, help="Export a specific lead ID")
+def research_export_cmd(output: str, fmt: str, lead_id: int | None):
+    """Export research findings and opportunities to CSV or JSON."""
+    conn = _get_conn()
+    try:
+        query = (
+            "SELECT l.id as lead_id, l.business_name, l.email, l.website, l.location, "
+            "r.status as research_status, r.confidence as research_confidence, "
+            "r.findings as research_findings, r.created_at as researched_at "
+            "FROM leads l "
+            "LEFT JOIN research r ON r.lead_id = l.id AND r.agent_type = 'website_researcher' "
+            "WHERE 1=1"
+        )
+        params: list = []
+        if lead_id:
+            query += " AND l.id = ?"
+            params.append(lead_id)
+
+        rows = conn.execute(query, params).fetchall()
+        if not rows:
+            console.print("[yellow]No research records found to export.[/yellow]")
+            return
+
+        exported_data = []
+        for row in rows:
+            record = dict(row)
+            opps = conn.execute(
+                "SELECT category, description, confidence, priority, evidence FROM opportunities WHERE lead_id = ?",
+                (row["lead_id"],),
+            ).fetchall()
+            record["opportunities"] = [
+                {
+                    "category": o["category"],
+                    "description": o["description"],
+                    "confidence": o["confidence"],
+                    "priority": o["priority"],
+                    "evidence": json.loads(o["evidence"]) if o["evidence"] else [],
+                }
+                for o in opps
+            ]
+            exported_data.append(record)
+
+        out_dir = os.path.dirname(os.path.abspath(output))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        if fmt == "json":
+            with open(output, "w", encoding="utf-8") as f:
+                json.dump(exported_data, f, indent=2)
+        else:
+            # Flatten for CSV
+            with open(output, "w", newline="", encoding="utf-8") as f:
+                fieldnames = [
+                    "lead_id", "business_name", "email", "website", "location",
+                    "research_status", "research_confidence", "opportunity_count",
+                    "top_opportunities", "researched_at",
+                ]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for item in exported_data:
+                    top_opps_str = "; ".join(
+                        f"{o['category']}({o['confidence']:.2f})"
+                        for o in item["opportunities"][:3]
+                    )
+                    writer.writerow({
+                        "lead_id": item["lead_id"],
+                        "business_name": item["business_name"],
+                        "email": item["email"],
+                        "website": item["website"],
+                        "location": item["location"],
+                        "research_status": item["research_status"],
+                        "research_confidence": item["research_confidence"],
+                        "opportunity_count": len(item["opportunities"]),
+                        "top_opportunities": top_opps_str,
+                        "researched_at": item["researched_at"],
+                    })
+
+        console.print(f"[green]✓ Exported {len(exported_data)} research records to {output}[/green]")
+    finally:
+        conn.close()
 
 
 # ── Entry point ──────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ class LeadStatus(str, Enum):
     """All valid lead pipeline statuses."""
     IMPORTED = "imported"
     RESEARCHING = "researching"
+    RESEARCHED = "researched"
     QUALIFIED = "qualified"
     READY_FOR_OUTREACH = "ready_for_outreach"
     SENT = "sent"
