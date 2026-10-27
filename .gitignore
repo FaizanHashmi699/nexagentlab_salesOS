@@ -27,6 +27,7 @@ ENV/
 credentials.json
 token.json
 oauth_token.json
+data/token.json
 
 # Data directory (contains DB and user data)
 data/*.db
