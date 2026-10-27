@@ -14,6 +14,7 @@ import os
 import click
 from rich import box
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
@@ -85,6 +86,33 @@ from .followup_scheduler import (
 )
 from .timeline import (
     get_lead_timeline,
+)
+from .pipeline import (
+    ALL_STAGES,
+    DealStage,
+    InvalidTransitionError,
+    SuppressedLeadError,
+    create_deal,
+    export_pipeline,
+    get_deal,
+    get_pipeline_report,
+    list_deals,
+    move_deal_stage,
+    update_deal,
+)
+from .meetings import (
+    BookingSource,
+    DuplicateBookingError,
+    MeetingStatus,
+    cancel_meeting,
+    complete_meeting,
+    create_meeting,
+    generate_meeting_brief,
+    get_meeting,
+    list_meetings,
+    record_meeting_outcome,
+    sync_calendly_events,
+    update_meeting,
 )
 
 # Force UTF-8 to avoid cp1252 encoding errors with Rich on Windows
@@ -1929,6 +1957,610 @@ def leads_timeline_cmd(lead_id: int):
         console.print(f"[red]Error displaying timeline: {e}[/red]")
     finally:
         conn.close()
+
+
+# ── Meetings Group (Milestone 6) ─────────────────────────────────────
+
+@cli.group("meetings")
+def meetings_group():
+    """Meeting lifecycle management, booking synchronization, and prep briefs."""
+
+
+@meetings_group.command("list")
+@click.option("--status", help="Filter by status (scheduled, completed, cancelled, no_show)")
+@click.option("--lead-id", type=int, help="Filter by lead ID")
+@click.option("--limit", type=int, default=20, help="Maximum meetings to list")
+def meetings_list_cmd(status: str | None, lead_id: int | None, limit: int):
+    """List scheduled and completed client discovery meetings."""
+    conn = _get_conn()
+    try:
+        meetings = list_meetings(conn, status=status, lead_id=lead_id, limit=limit)
+        if not meetings:
+            console.print("[yellow]No meetings found matching criteria.[/yellow]")
+            return
+
+        table = Table(title="Client Meetings", box=box.ROUNDED)
+        table.add_column("ID", style="dim", no_wrap=True)
+        table.add_column("Title", style="bold", no_wrap=True)
+        table.add_column("Business", style="cyan")
+        table.add_column("Scheduled Time (UTC)", style="white", no_wrap=True)
+        table.add_column("Status", style="magenta", no_wrap=True)
+        table.add_column("Source", style="dim")
+        table.add_column("Brief?", style="green")
+
+        status_colors = {
+            "scheduled": "bold blue",
+            "completed": "bold green",
+            "cancelled": "bold red",
+            "no_show": "bold yellow",
+        }
+
+        for m in meetings:
+            st = m["status"]
+            c = status_colors.get(st, "white")
+            has_brief = "YES" if m["brief_content"] else "no"
+            table.add_row(
+                str(m["id"]),
+                m["title"],
+                m["business_name"] or f"Lead #{m['lead_id']}",
+                m["scheduled_time"][:16].replace("T", " "),
+                f"[{c}]{st}[/{c}]",
+                m["booking_source"],
+                has_brief,
+            )
+
+        console.print(table)
+    finally:
+        conn.close()
+
+
+@meetings_group.command("show")
+@click.argument("meeting_id", type=int)
+def meetings_show_cmd(meeting_id: int):
+    """Inspect meeting details, attendee info, and recorded outcomes."""
+    conn = _get_conn()
+    try:
+        m = get_meeting(conn, meeting_id)
+        has_brief = "[green]Generated[/green]" if m["brief_content"] else "[dim]Not generated yet[/dim]"
+
+        outcome_panel = ""
+        if m["outcome_notes"]:
+            outcome_panel = (
+                f"\n\n[bold]Outcome Notes:[/bold] {m['outcome_notes']}\n"
+                f"[bold]Customer Needs:[/bold] {m['customer_needs'] or 'None recorded'}\n"
+                f"[bold]Confirmed Requirements:[/bold] {m['confirmed_requirements'] or 'None'}\n"
+                f"[bold]Agreed Actions:[/bold] {m['agreed_actions'] or 'None'} (Owner: {m['action_owner'] or 'Unassigned'})\n"
+                f"[bold]Next Step:[/bold] {m['next_step'] or 'None'}\n"
+                f"[bold]Proposal Needed:[/bold] {m['proposal_needed'].upper()}"
+            )
+
+        console.print(
+            Panel(
+                f"[bold]Title:[/bold] {m['title']}\n"
+                f"[bold]Business:[/bold] {m['business_name']} (Lead #{m['lead_id']})\n"
+                f"[bold]Contact Email:[/bold] {m['lead_email']}\n"
+                f"[bold]Scheduled Time:[/bold] {m['scheduled_time']} ({m['timezone']})\n"
+                f"[bold]Duration:[/bold] {m['duration_minutes']} minutes\n"
+                f"[bold]Location / Link:[/bold] {m['location_or_url'] or 'Not specified'}\n"
+                f"[bold]Status:[/bold] {m['status'].upper()}\n"
+                f"[bold]Booking Source:[/bold] {m['booking_source']}\n"
+                f"[bold]Preparation Brief:[/bold] {has_brief}\n"
+                f"[bold]Notes:[/bold] {m['notes'] or 'None'}"
+                f"{outcome_panel}",
+                title=f"Meeting #{m['id']}: {m['title']}",
+                border_style="cyan",
+            )
+        )
+    except Exception as e:
+        console.print(f"[red]Error displaying meeting: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@meetings_group.command("create")
+@click.option("--lead-id", type=int, prompt="Lead ID", help="Target lead ID")
+@click.option("--title", prompt="Meeting title", help="Meeting title")
+@click.option("--time", "scheduled_time", prompt="Scheduled time (e.g. 2026-11-05 14:00)", help="Scheduled time in ISO-8601")
+@click.option("--duration", type=int, default=30, help="Duration in minutes (default: 30)")
+@click.option("--timezone", "timezone_name", default="UTC", help="Timezone name (default: UTC)")
+@click.option("--url", "location_or_url", default=None, help="Meeting location or URL")
+@click.option("--notes", default=None, help="Pre-meeting notes")
+@click.option("--source", default="manual", help="Booking source (default: manual)")
+def meetings_create_cmd(
+    lead_id: int,
+    title: str,
+    scheduled_time: str,
+    duration: int,
+    timezone_name: str,
+    location_or_url: str | None,
+    notes: str | None,
+    source: str,
+):
+    """Schedule a new client discovery meeting."""
+    conn = _get_conn()
+    try:
+        meeting = create_meeting(
+            conn,
+            lead_id=lead_id,
+            title=title,
+            scheduled_time=scheduled_time,
+            duration_minutes=duration,
+            timezone_name=timezone_name,
+            location_or_url=location_or_url,
+            booking_source=source,
+            notes=notes,
+        )
+        console.print(
+            Panel(
+                f"[bold]Meeting ID:[/bold] {meeting['id']}\n"
+                f"[bold]Title:[/bold] {meeting['title']}\n"
+                f"[bold]Business:[/bold] {meeting['business_name']}\n"
+                f"[bold]Scheduled Time:[/bold] {meeting['scheduled_time']} ({meeting['timezone']})\n"
+                f"[bold]Status:[/bold] [green]{meeting['status'].upper()}[/green]",
+                title="Meeting Scheduled Successfully",
+                border_style="green",
+            )
+        )
+    except DuplicateBookingError as e:
+        console.print(f"[bold red]Duplicate Booking Error:[/bold red] {e}")
+    except Exception as e:
+        console.print(f"[red]Failed to schedule meeting: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@meetings_group.command("update")
+@click.argument("meeting_id", type=int)
+@click.option("--title", help="New title")
+@click.option("--time", "scheduled_time", help="New scheduled time")
+@click.option("--duration", type=int, help="New duration in minutes")
+@click.option("--timezone", "timezone_name", help="New timezone")
+@click.option("--url", "location_or_url", help="New location or URL")
+@click.option("--notes", help="New notes")
+def meetings_update_cmd(
+    meeting_id: int,
+    title: str | None,
+    scheduled_time: str | None,
+    duration: int | None,
+    timezone_name: str | None,
+    location_or_url: str | None,
+    notes: str | None,
+):
+    """Update details or reschedule an existing meeting."""
+    conn = _get_conn()
+    try:
+        kwargs: dict[str, Any] = {}
+        if title:
+            kwargs["title"] = title
+        if scheduled_time:
+            kwargs["scheduled_time"] = scheduled_time
+        if duration:
+            kwargs["duration_minutes"] = duration
+        if timezone_name:
+            kwargs["timezone"] = timezone_name
+        if location_or_url:
+            kwargs["location_or_url"] = location_or_url
+        if notes:
+            kwargs["notes"] = notes
+
+        updated = update_meeting(conn, meeting_id, **kwargs)
+        console.print(f"[green]Meeting #{updated['id']} updated successfully.[/green]")
+    except Exception as e:
+        console.print(f"[red]Error updating meeting: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@meetings_group.command("cancel")
+@click.argument("meeting_id", type=int)
+@click.option("--reason", required=True, prompt="Cancellation reason", help="Cancellation reason")
+def meetings_cancel_cmd(meeting_id: int, reason: str):
+    """Cancel a scheduled meeting and record the cancellation reason."""
+    conn = _get_conn()
+    try:
+        cancelled = cancel_meeting(conn, meeting_id, reason=reason)
+        console.print(f"[yellow]Meeting #{cancelled['id']} cancelled. Reason: {reason}[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error cancelling meeting: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@meetings_group.command("complete")
+@click.argument("meeting_id", type=int)
+def meetings_complete_cmd(meeting_id: int):
+    """Mark a meeting as completed and trigger pipeline progression."""
+    conn = _get_conn()
+    try:
+        m = complete_meeting(conn, meeting_id)
+        console.print(f"[green]Meeting #{m['id']} marked as completed. Associated deal moved to 'meeting_completed'.[/green]")
+    except Exception as e:
+        console.print(f"[red]Error completing meeting: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@meetings_group.command("brief")
+@click.argument("meeting_id", type=int)
+@click.option("--force-ai", is_flag=True, help="Force LLM assistant generation")
+@click.option("--no-ai", is_flag=True, help="Use deterministic evidence-based brief")
+def meetings_brief_cmd(meeting_id: int, force_ai: bool, no_ai: bool):
+    """Generate or view evidence-backed meeting preparation brief."""
+    conn = _get_conn()
+    try:
+        brief_text = generate_meeting_brief(conn, meeting_id, force_ai=force_ai, no_ai=no_ai)
+        console.print(Markdown(brief_text))
+    except Exception as e:
+        console.print(f"[red]Error generating meeting brief: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@meetings_group.command("outcome")
+@click.argument("meeting_id", type=int)
+@click.option("--notes", required=True, prompt="Outcome summary notes", help="Summary notes of the call")
+@click.option("--needs", default=None, help="Customer needs identified")
+@click.option("--requirements", default=None, help="Confirmed technical or business requirements")
+@click.option("--objections", default=None, help="Customer objections or concerns")
+@click.option("--actions", default=None, help="Agreed actions")
+@click.option("--owner", default=None, help="Action assignee")
+@click.option("--due-date", default=None, help="Action due date (YYYY-MM-DD)")
+@click.option("--proposal", type=click.Choice(["yes", "no", "unknown"]), default="unknown", help="Proposal needed?")
+@click.option("--followup", is_flag=True, help="Generate follow-up draft message for review")
+@click.option("--next-step", default=None, help="Next scheduled step")
+def meetings_outcome_cmd(
+    meeting_id: int,
+    notes: str,
+    needs: str | None,
+    requirements: str | None,
+    objections: str | None,
+    actions: str | None,
+    owner: str | None,
+    due_date: str | None,
+    proposal: str,
+    followup: bool,
+    next_step: str | None,
+):
+    """Record post-meeting structured review and outcomes."""
+    conn = _get_conn()
+    try:
+        m = record_meeting_outcome(
+            conn,
+            meeting_id,
+            outcome_notes=notes,
+            customer_needs=needs,
+            confirmed_requirements=requirements,
+            objections=objections,
+            agreed_actions=actions,
+            action_owner=owner,
+            action_due_date=due_date,
+            proposal_needed=proposal,
+            followup_required=followup,
+            next_step=next_step,
+        )
+        msg_note = "\n[bold yellow]Draft follow-up email created for human review.[/bold yellow]" if followup else ""
+        console.print(
+            Panel(
+                f"[bold]Meeting #{m['id']} Completed[/bold]\n"
+                f"[bold]Business:[/bold] {m['business_name']}\n"
+                f"[bold]Outcome Notes:[/bold] {notes}\n"
+                f"[bold]Proposal Needed:[/bold] {proposal.upper()}\n"
+                f"[bold]Next Step:[/bold] {next_step or 'None'}"
+                f"{msg_note}",
+                title="Post-Meeting Outcome Recorded",
+                border_style="green",
+            )
+        )
+    except Exception as e:
+        console.print(f"[red]Error recording outcome: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@meetings_group.command("sync")
+@click.option("--token", default=None, help="Calendly personal access token")
+@click.option("--user-uri", default=None, help="Calendly user URI")
+def meetings_sync_cmd(token: str | None, user_uri: str | None):
+    """Synchronize scheduled events from Calendly API (optional)."""
+    conn = _get_conn()
+    try:
+        res = sync_calendly_events(conn, access_token=token, user_uri=user_uri)
+        if res["status"] == "unconfigured":
+            console.print(
+                Panel(
+                    f"[bold yellow]Calendly Integration Optional / Unconfigured[/bold yellow]\n\n"
+                    f"{res['message']}\n"
+                    f"To enable Calendly synchronization:\n"
+                    f"1. Generate a Personal Access Token in Calendly > Integrations.\n"
+                    f"2. Add `CALENDLY_ACCESS_TOKEN=your-token` to your `.env` file.\n"
+                    f"Offline meeting management and manual booking remain 100% operational.",
+                    title="Calendly Sync Status",
+                    border_style="yellow",
+                )
+            )
+        elif res["status"] == "success":
+            console.print(f"[green]Successfully synced {res['synced_count']} event(s) from Calendly.[/green]")
+        else:
+            console.print(f"[red]Calendly sync failed: {res.get('message')}[/red]")
+    finally:
+        conn.close()
+
+
+# ── Pipeline Group (Milestone 6) ─────────────────────────────────────
+
+@cli.group("pipeline")
+def pipeline_group():
+    """Sales pipeline, deal intelligence, and stage transition engine."""
+
+
+@pipeline_group.command("board")
+def pipeline_board_cmd():
+    """Display interactive visual sales pipeline board across stages."""
+    conn = _get_conn()
+    try:
+        deals = list_deals(conn, limit=200)
+        report = get_pipeline_report(conn)
+
+        console.print(
+            Panel(
+                f"[bold]Active Deals in Pipeline:[/bold] [green]{report['total_active_deals']}[/green]   |   "
+                f"[bold]Total Active Value:[/bold] [bold green]${report['total_pipeline_value']:,.2f}[/bold green]   |   "
+                f"[bold]Win Rate:[/bold] [cyan]{report['performance']['win_rate_percent']}%[/cyan] "
+                f"({report['performance']['won_count']} Won / {report['performance']['lost_count']} Lost)",
+                title="Sales Pipeline Overview",
+                border_style="green",
+            )
+        )
+
+        table = Table(title="Sales Deals by Pipeline Stage", box=box.ROUNDED)
+        table.add_column("ID", style="dim", no_wrap=True)
+        table.add_column("Deal Name", style="bold", no_wrap=True)
+        table.add_column("Business", style="cyan")
+        table.add_column("Stage", style="magenta", no_wrap=True)
+        table.add_column("Est. Value", style="green", no_wrap=True)
+        table.add_column("Owner", style="white")
+        table.add_column("Next Action", style="yellow")
+        table.add_column("Due Date", style="dim", no_wrap=True)
+
+        stage_styles = {
+            "lead_captured": "dim",
+            "outreach_ready": "cyan",
+            "contacted": "blue",
+            "engaged": "bold blue",
+            "meeting_booked": "bold magenta",
+            "meeting_completed": "bold cyan",
+            "proposal_sent": "bold yellow",
+            "negotiation": "bold yellow",
+            "won": "bold green",
+            "lost": "bold red",
+        }
+
+        for d in deals:
+            st = d["stage"]
+            st_color = stage_styles.get(st, "white")
+            val_str = f"${d['estimated_value']:,.2f}" if d["estimated_value"] is not None else "[dim]Unspecified[/dim]"
+            table.add_row(
+                str(d["id"]),
+                d["name"],
+                d["business_name"],
+                f"[{st_color}]{st}[/{st_color}]",
+                val_str,
+                d["owner"] or "[dim]Unassigned[/dim]",
+                d["next_action"] or "[dim]None[/dim]",
+                d["next_action_due"] or "-",
+            )
+
+        console.print(table)
+    finally:
+        conn.close()
+
+
+@pipeline_group.command("show")
+@click.argument("deal_id", type=int)
+def pipeline_show_cmd(deal_id: int):
+    """Deep inspection of a sales deal and its evidentiary stage history."""
+    conn = _get_conn()
+    try:
+        deal = get_deal(conn, deal_id)
+        val_str = f"${deal['estimated_value']:,.2f} {deal['currency']}" if deal["estimated_value"] is not None else "Unspecified"
+        conf_str = f"{deal['confidence'] * 100:.0f}%" if deal["confidence"] is not None else "Unspecified"
+
+        console.print(
+            Panel(
+                f"[bold]Deal Name:[/bold] {deal['name']}\n"
+                f"[bold]Lead Business:[/bold] {deal['business_name']} (Lead #{deal['lead_id']})\n"
+                f"[bold]Service Interest:[/bold] {deal['service_interest'] or 'General'}\n"
+                f"[bold]Current Stage:[/bold] [bold magenta]{deal['stage'].upper()}[/bold magenta]\n"
+                f"[bold]Estimated Value:[/bold] {val_str}\n"
+                f"[bold]Win Probability:[/bold] {conf_str} ({deal['confidence_explanation'] or 'None'})\n"
+                f"[bold]Owner / Assignee:[/bold] {deal['owner'] or 'Unassigned'}\n"
+                f"[bold]Expected Close Date:[/bold] {deal['expected_close_date'] or 'Unspecified'}\n"
+                f"[bold]Next Action:[/bold] {deal['next_action'] or 'None'} (Due: {deal['next_action_due'] or 'None'})\n"
+                f"[bold]Last Activity:[/bold] {deal['last_activity_at']}",
+                title=f"Deal #{deal['id']}: {deal['name']}",
+                border_style="cyan",
+            )
+        )
+
+        ev_list = deal["stage_evidence"]
+        if ev_list:
+            table_ev = Table(title="Evidentiary Stage Transition Log", box=box.SIMPLE)
+            table_ev.add_column("Timestamp", style="dim")
+            table_ev.add_column("Transition", style="bold")
+            table_ev.add_column("Actor / Trigger", style="cyan")
+            table_ev.add_column("Notes / Evidence", style="white")
+
+            for ev in ev_list:
+                tr = f"{ev.get('from_stage', 'start')} ➔ {ev.get('to_stage', deal['stage'])}"
+                actor = ev.get("actor", "system")
+                notes = ev.get("override_reason") or ev.get("trigger_event") or "Verified"
+                table_ev.add_row(ev.get("timestamp", "")[:19], tr, actor, str(notes))
+
+            console.print(table_ev)
+    except Exception as e:
+        console.print(f"[red]Error displaying deal: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@pipeline_group.command("move")
+@click.argument("deal_id", type=int)
+@click.argument("stage")
+@click.option("--force", is_flag=True, help="Force override transition constraints")
+@click.option("--reason", default=None, help="Auditable justification if force=True")
+@click.option("--win-notes", default=None, help="Confirmation notes if marking won")
+@click.option("--loss-reason", default=None, help="Explicit reason if marking lost")
+def pipeline_move_cmd(
+    deal_id: int,
+    stage: str,
+    force: bool,
+    reason: str | None,
+    win_notes: str | None,
+    loss_reason: str | None,
+):
+    """Transition a deal to a new pipeline stage with validation."""
+    conn = _get_conn()
+    try:
+        evidence: dict[str, Any] = {}
+        if win_notes:
+            evidence["win_notes"] = win_notes
+        if loss_reason:
+            evidence["loss_reason"] = loss_reason
+
+        updated = move_deal_stage(
+            conn,
+            deal_id,
+            target_stage=stage,
+            evidence=evidence,
+            force=force,
+            reason=reason,
+            actor="cli_user",
+        )
+        console.print(f"[green]Deal #{deal_id} successfully moved to stage '{updated['stage']}'.[/green]")
+    except (InvalidTransitionError, SuppressedLeadError, ValueError) as e:
+        console.print(f"[bold red]Transition Rejected:[/bold red] {e}")
+    except Exception as e:
+        console.print(f"[red]Error moving deal: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@pipeline_group.command("update")
+@click.argument("deal_id", type=int)
+@click.option("--name", help="New deal name")
+@click.option("--value", type=float, help="Estimated deal value")
+@click.option("--currency", default="USD", help="Currency")
+@click.option("--owner", help="Assignee / deal owner")
+@click.option("--next-action", help="Next action description")
+@click.option("--due", "next_action_due", help="Next action due date (YYYY-MM-DD)")
+@click.option("--confidence", type=float, help="Win probability (0.0 - 1.0)")
+def pipeline_update_cmd(
+    deal_id: int,
+    name: str | None,
+    value: float | None,
+    currency: str,
+    owner: str | None,
+    next_action: str | None,
+    next_action_due: str | None,
+    confidence: float | None,
+):
+    """Update deal value, owner, next action, or probability."""
+    conn = _get_conn()
+    try:
+        kwargs: dict[str, Any] = {}
+        if name:
+            kwargs["name"] = name
+        if value is not None:
+            kwargs["estimated_value"] = value
+            kwargs["currency"] = currency
+        if owner:
+            kwargs["owner"] = owner
+        if next_action:
+            kwargs["next_action"] = next_action
+        if next_action_due:
+            kwargs["next_action_due"] = next_action_due
+        if confidence is not None:
+            kwargs["confidence"] = confidence
+
+        updated = update_deal(conn, deal_id, **kwargs)
+        console.print(f"[green]Deal #{updated['id']} updated successfully.[/green]")
+    except Exception as e:
+        console.print(f"[red]Error updating deal: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@pipeline_group.command("report")
+@click.option("--stalled-days", type=int, default=14, help="Inactivity days for stalled deals")
+def pipeline_report_cmd(stalled_days: int):
+    """Display comprehensive executive sales pipeline & deal intelligence report."""
+    conn = _get_conn()
+    try:
+        rep = get_pipeline_report(conn, inactive_days=stalled_days)
+
+        console.print(
+            Panel(
+                f"[bold]Active Pipeline Deals:[/bold] [green]{rep['total_active_deals']}[/green]   |   "
+                f"[bold]Total Active Value:[/bold] [bold green]${rep['total_pipeline_value']:,.2f}[/bold green]   |   "
+                f"[bold]Win Rate:[/bold] [bold cyan]{rep['performance']['win_rate_percent']}%[/bold cyan] "
+                f"({rep['performance']['won_count']} Won / {rep['performance']['lost_count']} Lost)",
+                title="Executive Pipeline Intelligence Report",
+                border_style="green",
+            )
+        )
+
+        # Stage table
+        table_stages = Table(title="Pipeline Stages & Valuations", box=box.ROUNDED)
+        table_stages.add_column("Stage", style="bold")
+        table_stages.add_column("Deals Count", style="white")
+        table_stages.add_column("Deals With Value", style="cyan")
+        table_stages.add_column("Total Value (USD)", style="green")
+
+        for stage, data in rep["by_stage"].items():
+            table_stages.add_row(
+                stage,
+                str(data["count"]),
+                str(data["valued_count"]),
+                f"${data['total_value']:,.2f}",
+            )
+        console.print(table_stages)
+
+        # Action Cues
+        cues = rep["action_cues"]
+        console.print(
+            Panel(
+                f"[bold]Leads Awaiting Contact:[/bold] {cues['leads_awaiting_contact']}\n"
+                f"[bold]Positive Replies Needing Review:[/bold] [bold yellow]{cues['positive_replies_review']}[/bold yellow]\n"
+                f"[bold]Meetings Needing Preparation Brief:[/bold] [bold yellow]{cues['meetings_needing_prep']}[/bold yellow]\n"
+                f"[bold]Deals With Overdue Next Actions:[/bold] [bold red]{cues['overdue_actions']}[/bold red]\n"
+                f"[bold]Stalled Deals (> {stalled_days} days inactive):[/bold] [bold red]{cues['stalled_deals']}[/bold red]",
+                title="Immediate Action Cues & Health",
+                border_style="yellow",
+            )
+        )
+
+        # Data quality warnings
+        if rep["data_quality_warnings"]:
+            warn_text = "\n".join(f"[bold yellow]![/bold yellow] {w}" for w in rep["data_quality_warnings"])
+            console.print(Panel(warn_text, title="Data Quality Warnings", border_style="red"))
+    finally:
+        conn.close()
+
+
+@pipeline_group.command("export")
+@click.argument("filepath")
+@click.option("--format", "fmt", type=click.Choice(["csv", "json"]), default="csv", help="Export format")
+def pipeline_export_cmd(filepath: str, fmt: str):
+    """Export complete sales pipeline and deals to CSV or JSON."""
+    conn = _get_conn()
+    try:
+        count = export_pipeline(conn, filepath=filepath, format=fmt)
+        console.print(f"[green]Successfully exported {count} deal(s) to '{filepath}' ({fmt.upper()}).[/green]")
+    except Exception as e:
+        console.print(f"[red]Export failed: {e}[/red]")
+    finally:
+        conn.close()
+
 
 
 # ── Entry point ──────────────────────────────────────────────────────

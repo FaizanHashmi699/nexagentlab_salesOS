@@ -11,7 +11,7 @@
 🟢 **Milestone 3** — Lead Qualification, Service Matching & Personalization  
 🟢 **Milestone 4** — Gmail OAuth Integration & Controlled Outreach  
 🟢 **Milestone 5** — Reply Intelligence, Classification & Follow-up Automation  
-⬜ Milestone 6 — Dashboard & campaign management  
+🟢 **Milestone 6** — Meeting Management, Sales Pipeline & Deal Intelligence  
 
 ## Quick Start (Windows)
 
@@ -218,11 +218,66 @@ salesos followups status
 salesos leads timeline <LEAD_ID>
 ```
 
-### 10. Run Tests
+### 10. Meeting Management & Sales Pipeline Intelligence
+
+```powershell
+# List client discovery meetings (scheduled, completed, cancelled)
+salesos meetings list
+salesos meetings list --status scheduled
+
+# Inspect deep meeting details, attendees, and recorded outcomes
+salesos meetings show <MEETING_ID>
+
+# Schedule a new meeting manually
+salesos meetings create --lead-id 1 --title "Discovery Call" --time "2026-11-15 14:00"
+
+# Reschedule or update a meeting
+salesos meetings update <MEETING_ID> --time "2026-11-16 15:00" --url "https://meet.google.com/abc"
+
+# Cancel a meeting with an auditable reason
+salesos meetings cancel <MEETING_ID> --reason "Client requested reschedule"
+
+# Mark a meeting as completed (auto-advances linked deal stage)
+salesos meetings complete <MEETING_ID>
+
+# Generate evidence-grounded meeting preparation brief (cites research evidence IDs)
+salesos meetings brief <MEETING_ID>
+salesos meetings brief <MEETING_ID> --no-ai
+
+# Record structured post-meeting review and outcomes (generates draft follow-up if requested)
+salesos meetings outcome <MEETING_ID> --notes "Interested in booking automation" --proposal yes --followup --next-step "Send proposal"
+
+# Synchronize meetings with Calendly API (optional)
+salesos meetings sync
+
+# View interactive sales pipeline board grouped by stages
+salesos pipeline board
+
+# Inspect single deal history and evidentiary stage transitions
+salesos pipeline show <DEAL_ID>
+
+# Advance deal to next stage with evidence validation
+salesos pipeline move <DEAL_ID> <STAGE>
+salesos pipeline move <DEAL_ID> won --win-notes "Contract signed for $3,500"
+salesos pipeline move <DEAL_ID> lost --loss-reason "Budget constraints"
+salesos pipeline move <DEAL_ID> <STAGE> --force --reason "Manual executive override"
+
+# Update deal value, owner, next action, or probability
+salesos pipeline update <DEAL_ID> --value 3500 --owner "Saif" --next-action "Send contract"
+
+# Generate comprehensive executive sales pipeline report
+salesos pipeline report
+
+# Export pipeline deals to CSV or JSON
+salesos pipeline export data/exports/pipeline.csv
+salesos pipeline export data/exports/pipeline.json --format json
+```
+
+### 11. Run Tests
 
 ```powershell
 pytest tests/ -v
-# Total tests: 188 passed (100% pass rate, zero regressions across Milestones 1–5)
+# Total tests: 222 passed (100% pass rate, zero regressions across Milestones 1–6)
 ```
 
 ## Google Cloud OAuth Setup (Zero Paid Services)
@@ -300,6 +355,8 @@ Or in `.env`: `CAMPAIGN_KILL_SWITCH=true`. All outreach commands will immediatel
 | `followups` | Business-day scheduled follow-up steps, review status |
 | `sync_checkpoints` | Incremental Gmail historyId synchronization state |
 | `suppression` | Opt-out / bounce / invalid email blocklist |
+| `deals` | Sales opportunities, pipeline stages, values, owner, and stage evidence |
+| `meetings` | Scheduled and completed client calls, briefs, and structured outcomes |
 | `audit_log` | Full audit trail of all system actions |
 
 ## Configuration

@@ -246,6 +246,84 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+
+-- ============================================================
+-- Deals / Sales Opportunities (Milestone 6)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS deals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER NOT NULL REFERENCES leads(id),
+    name TEXT NOT NULL,
+    service_interest TEXT,
+    stage TEXT NOT NULL DEFAULT 'lead_captured'
+        CHECK (stage IN (
+            'lead_captured', 'outreach_ready', 'contacted', 'engaged',
+            'meeting_booked', 'meeting_completed', 'proposal_sent',
+            'negotiation', 'won', 'lost'
+        )),
+    estimated_value REAL,
+    currency TEXT DEFAULT 'USD',
+    confidence REAL,
+    confidence_explanation TEXT,
+    owner TEXT,
+    expected_close_date TEXT,
+    source_campaign_id INTEGER REFERENCES campaigns(id),
+    last_activity_at TEXT NOT NULL DEFAULT (datetime('now')),
+    next_action TEXT,
+    next_action_due TEXT,
+    loss_reason TEXT,
+    win_notes TEXT,
+    stage_evidence TEXT,     -- JSON array of trigger evidence
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_deals_lead ON deals(lead_id);
+CREATE INDEX IF NOT EXISTS idx_deals_stage ON deals(stage);
+CREATE INDEX IF NOT EXISTS idx_deals_owner ON deals(owner);
+
+-- ============================================================
+-- Meetings (Milestone 6)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS meetings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER NOT NULL REFERENCES leads(id),
+    deal_id INTEGER REFERENCES deals(id),
+    title TEXT NOT NULL,
+    scheduled_time TEXT NOT NULL,
+    duration_minutes INTEGER DEFAULT 30,
+    timezone TEXT DEFAULT 'UTC',
+    location_or_url TEXT,
+    status TEXT DEFAULT 'scheduled'
+        CHECK (status IN ('scheduled', 'completed', 'cancelled', 'no_show')),
+    booking_source TEXT DEFAULT 'manual'
+        CHECK (booking_source IN ('calendly', 'manual', 'email_inbound', 'inbound_reply')),
+    external_booking_id TEXT,
+    calendar_event_id TEXT,
+    cancellation_reason TEXT,
+    notes TEXT,
+    brief_content TEXT,
+    brief_generated_at TEXT,
+    outcome_notes TEXT,
+    customer_needs TEXT,
+    confirmed_requirements TEXT,
+    objections TEXT,
+    agreed_actions TEXT,
+    action_owner TEXT,
+    action_due_date TEXT,
+    proposal_needed TEXT DEFAULT 'unknown'
+        CHECK (proposal_needed IN ('yes', 'no', 'unknown')),
+    followup_required INTEGER DEFAULT 0,
+    next_step TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_meetings_lead ON meetings(lead_id);
+CREATE INDEX IF NOT EXISTS idx_meetings_deal ON meetings(deal_id);
+CREATE INDEX IF NOT EXISTS idx_meetings_scheduled ON meetings(scheduled_time, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_meetings_external_id ON meetings(external_booking_id) WHERE external_booking_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_meetings_lead_time ON meetings(lead_id, scheduled_time) WHERE status != 'cancelled';
 """
 
 
@@ -346,6 +424,86 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_replies_gmail_msg ON replies(gmail_message_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_classification ON replies(classification)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_needs_review ON replies(needs_review)")
+    except sqlite3.OperationalError:
+        pass
+
+    # Ensure deals table exists for pre-Milestone-6 databases
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS deals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lead_id INTEGER NOT NULL REFERENCES leads(id),
+        name TEXT NOT NULL,
+        service_interest TEXT,
+        stage TEXT NOT NULL DEFAULT 'lead_captured'
+            CHECK (stage IN (
+                'lead_captured', 'outreach_ready', 'contacted', 'engaged',
+                'meeting_booked', 'meeting_completed', 'proposal_sent',
+                'negotiation', 'won', 'lost'
+            )),
+        estimated_value REAL,
+        currency TEXT DEFAULT 'USD',
+        confidence REAL,
+        confidence_explanation TEXT,
+        owner TEXT,
+        expected_close_date TEXT,
+        source_campaign_id INTEGER REFERENCES campaigns(id),
+        last_activity_at TEXT NOT NULL DEFAULT (datetime('now')),
+        next_action TEXT,
+        next_action_due TEXT,
+        loss_reason TEXT,
+        win_notes TEXT,
+        stage_evidence TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+    """)
+
+    # Ensure meetings table exists for pre-Milestone-6 databases
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS meetings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        lead_id INTEGER NOT NULL REFERENCES leads(id),
+        deal_id INTEGER REFERENCES deals(id),
+        title TEXT NOT NULL,
+        scheduled_time TEXT NOT NULL,
+        duration_minutes INTEGER DEFAULT 30,
+        timezone TEXT DEFAULT 'UTC',
+        location_or_url TEXT,
+        status TEXT DEFAULT 'scheduled'
+            CHECK (status IN ('scheduled', 'completed', 'cancelled', 'no_show')),
+        booking_source TEXT DEFAULT 'manual'
+            CHECK (booking_source IN ('calendly', 'manual', 'email_inbound', 'inbound_reply')),
+        external_booking_id TEXT,
+        calendar_event_id TEXT,
+        cancellation_reason TEXT,
+        notes TEXT,
+        brief_content TEXT,
+        brief_generated_at TEXT,
+        outcome_notes TEXT,
+        customer_needs TEXT,
+        confirmed_requirements TEXT,
+        objections TEXT,
+        agreed_actions TEXT,
+        action_owner TEXT,
+        action_due_date TEXT,
+        proposal_needed TEXT DEFAULT 'unknown'
+            CHECK (proposal_needed IN ('yes', 'no', 'unknown')),
+        followup_required INTEGER DEFAULT 0,
+        next_step TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+    """)
+
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_deals_lead ON deals(lead_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_deals_stage ON deals(stage)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_deals_owner ON deals(owner)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_meetings_lead ON meetings(lead_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_meetings_deal ON meetings(deal_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_meetings_scheduled ON meetings(scheduled_time, status)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_meetings_external_id ON meetings(external_booking_id) WHERE external_booking_id IS NOT NULL")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_meetings_lead_time ON meetings(lead_id, scheduled_time) WHERE status != 'cancelled'")
     except sqlite3.OperationalError:
         pass
 

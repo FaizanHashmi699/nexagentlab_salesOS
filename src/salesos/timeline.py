@@ -189,6 +189,69 @@ def get_lead_timeline(conn: sqlite3.Connection, lead_id: int) -> dict:
             "badge": "error",
         })
 
+    # 8. Deals & Stage Transitions (Milestone 6)
+    deal_rows = conn.execute(
+        "SELECT * FROM deals WHERE lead_id = ? ORDER BY created_at ASC",
+        (lead_id,),
+    ).fetchall()
+    for d in deal_rows:
+        events.append({
+            "timestamp": d["created_at"],
+            "type": "deal_created",
+            "title": f"Deal Created: '{d['name']}'",
+            "description": f"Stage: [{d['stage'].upper()}]"
+                           + (f" | Value: ${d['estimated_value']:,.2f} {d['currency']}" if d["estimated_value"] else ""),
+            "badge": "info",
+        })
+        try:
+            ev_list = json.loads(d["stage_evidence"]) if d["stage_evidence"] else []
+            for ev in ev_list:
+                to_st = ev.get("to_stage")
+                if to_st:
+                    events.append({
+                        "timestamp": ev.get("timestamp") or d["updated_at"],
+                        "type": "deal_stage_moved",
+                        "title": f"Deal Stage: [{to_st.upper()}]",
+                        "description": f"From [{ev.get('from_stage', '').upper()}] | Trigger: {ev.get('actor', 'system')}"
+                                       + (f" — Reason: {ev.get('override_reason')}" if ev.get("override_reason") else ""),
+                        "badge": "success" if to_st in ("won", "meeting_booked") else ("error" if to_st == "lost" else "info"),
+                    })
+        except Exception:
+            pass
+
+    # 9. Meetings (Milestone 6)
+    meeting_rows = conn.execute(
+        "SELECT * FROM meetings WHERE lead_id = ? ORDER BY scheduled_time ASC",
+        (lead_id,),
+    ).fetchall()
+    for m in meeting_rows:
+        mid = m["id"]
+        status = m["status"]
+        events.append({
+            "timestamp": m["created_at"],
+            "type": "meeting_scheduled",
+            "title": f"Meeting #{mid} Scheduled: '{m['title']}'",
+            "description": f"Time: {m['scheduled_time']} ({m['timezone']}) | Source: {m['booking_source']}",
+            "badge": "info",
+        })
+        if status == "completed":
+            events.append({
+                "timestamp": m["updated_at"],
+                "type": "meeting_completed",
+                "title": f"Meeting #{mid} Completed",
+                "description": f"Outcome: {m['outcome_notes'] or 'Discussion completed'}"
+                               + (f" | Next: {m['next_step']}" if m["next_step"] else ""),
+                "badge": "success",
+            })
+        elif status == "cancelled":
+            events.append({
+                "timestamp": m["updated_at"],
+                "type": "meeting_cancelled",
+                "title": f"Meeting #{mid} Cancelled",
+                "description": f"Reason: {m['cancellation_reason'] or 'Cancelled'}",
+                "badge": "warning",
+            })
+
     # Sort events chronologically
     def parse_time(e: dict) -> str:
         t = e.get("timestamp") or "1970-01-01"
