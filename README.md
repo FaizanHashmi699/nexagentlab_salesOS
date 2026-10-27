@@ -10,7 +10,7 @@
 🟢 **Milestone 2** — Research Agent & Opportunity Identification  
 🟢 **Milestone 3** — Lead Qualification, Service Matching & Personalization  
 🟢 **Milestone 4** — Gmail OAuth Integration & Controlled Outreach  
-⬜ Milestone 5 — Reply management & sales pipeline  
+🟢 **Milestone 5** — Reply Intelligence, Classification & Follow-up Automation  
 ⬜ Milestone 6 — Dashboard & campaign management  
 
 ## Quick Start (Windows)
@@ -166,11 +166,63 @@ salesos outreach suppress client@example.com --reason opt_out
 salesos outreach status
 ```
 
-### 9. Run Tests
+### 9. Reply Intelligence & Follow-Up Automation
+
+```powershell
+# Synchronize inbound customer replies from Gmail (dry run preview)
+salesos replies sync --dry-run
+
+# Synchronize inbound customer replies live using Gmail historyId
+salesos replies sync
+
+# Force full recovery sync if history cursor expires
+salesos replies sync --force-recovery
+
+# List received replies and their classification states
+salesos replies list
+salesos replies list --classification positive_interest
+salesos replies list --needs-review
+
+# View detailed reply information with email thread and suggested response draft
+salesos replies show <REPLY_ID>
+
+# Classify unclassified replies (deterministic rules + free LLM fallback)
+salesos replies classify --pending
+
+# Human review and approve suggested response
+salesos replies review <REPLY_ID> --approve-reply
+salesos replies review <REPLY_ID> --override-class question --reply-text "Custom response..."
+
+# Check inbound synchronization and classification metrics
+salesos replies status
+
+# Evaluate unresponsive leads and plan business-day follow-up steps (skips weekends)
+salesos followups plan
+
+# List follow-ups that have reached their scheduled due date
+salesos followups due
+
+# Preview a scheduled follow-up draft and recipient details
+salesos followups preview <FOLLOWUP_ID>
+
+# Explicitly approve a scheduled follow-up draft for outreach
+salesos followups approve <FOLLOWUP_ID>
+
+# Cancel a scheduled follow-up
+salesos followups cancel <FOLLOWUP_ID> --reason "Client contacted via phone"
+
+# View follow-up sequence automation status and pipeline summary
+salesos followups status
+
+# View unified CRM conversation timeline for a specific lead
+salesos leads timeline <LEAD_ID>
+```
+
+### 10. Run Tests
 
 ```powershell
 pytest tests/ -v
-# Total tests: 149 passed (100% pass rate, zero regressions)
+# Total tests: 188 passed (100% pass rate, zero regressions across Milestones 1–5)
 ```
 
 ## Google Cloud OAuth Setup (Zero Paid Services)
@@ -191,6 +243,9 @@ To authenticate your Gmail account (`nexagentlab.tech@gmail.com`) for draft sync
 7. Run `salesos gmail auth`, open the provided URL in your browser, sign in with `nexagentlab.tech@gmail.com`, and provide the authorization code.
 
 Tokens are stored securely in `data/token.json` and are automatically refreshed. Secrets and tokens are never printed, committed, or leaked in logs.
+
+> [!IMPORTANT]
+> **Milestone 5 Scope Requirement**: Inbound reply monitoring and classification requires reading incoming messages (`https://www.googleapis.com/auth/gmail.readonly`). If you authenticated prior to Milestone 5, run `salesos gmail auth` to grant the readonly scope. You can verify your active scopes at any time with `salesos gmail status`.
 
 ## Explicit Live-Send Activation Procedure
 
@@ -241,7 +296,9 @@ Or in `.env`: `CAMPAIGN_KILL_SWITCH=true`. All outreach commands will immediatel
 | `opportunities` | Identified business improvement opportunities |
 | `campaigns` | Outreach campaign configuration & status |
 | `messages` | Email drafts, queue, and delivery records |
-| `replies` | Classified inbound replies |
+| `replies` | Classified inbound replies, sentiment, suggested response |
+| `followups` | Business-day scheduled follow-up steps, review status |
+| `sync_checkpoints` | Incremental Gmail historyId synchronization state |
 | `suppression` | Opt-out / bounce / invalid email blocklist |
 | `audit_log` | Full audit trail of all system actions |
 

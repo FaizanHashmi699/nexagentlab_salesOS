@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .db import get_connection, get_db_path, init_db
+from .db import get_connection, get_db_path, init_db, transaction
 from .importer import ImportResult, import_leads, preview_import
 from .researcher import (
     extract_evidence,
@@ -66,6 +66,25 @@ from .suppression import (
     is_email_suppressed,
     list_suppressions,
     record_suppression,
+)
+from .reply_syncer import (
+    get_last_checkpoint,
+    sync_inbound_replies,
+)
+from .classifier import (
+    CLASSIFICATION_CATEGORIES,
+    classify_pending_replies,
+    classify_reply,
+)
+from .followup_scheduler import (
+    approve_followup,
+    cancel_followup,
+    get_due_followups,
+    get_followups_status,
+    plan_followups,
+)
+from .timeline import (
+    get_lead_timeline,
 )
 
 # Force UTF-8 to avoid cp1252 encoding errors with Rich on Windows
@@ -1338,6 +1357,576 @@ def outreach_status_cmd():
         table.add_row("Configured Agency Sender", s["configured_sender"])
 
         console.print(table)
+    finally:
+        conn.close()
+
+
+# ── Replies Group ────────────────────────────────────────────────────
+
+@cli.group("replies")
+def replies_group():
+    """Inbound reply monitoring, classification & response management."""
+
+
+@replies_group.command("sync")
+@click.option("--dry-run", is_flag=True, help="Preview messages that would be synced without saving")
+@click.option("--limit", type=int, default=50, help="Maximum messages to evaluate")
+@click.option("--force-recovery", is_flag=True, help="Ignore history checkpoint and perform full recovery sync")
+def replies_sync_cmd(dry_run: bool, limit: int, force_recovery: bool):
+    """Synchronize inbound email replies from Gmail."""
+    conn = _get_conn()
+    try:
+        console.print(f"Connecting to Gmail (Mode: {'[yellow]DRY RUN[/yellow]' if dry_run else '[green]LIVE SYNC[/green]'})...")
+        res = sync_inbound_replies(
+            conn,
+            dry_run=dry_run,
+            max_messages=limit,
+            force_recovery=force_recovery,
+        )
+
+        table = Table(title="Gmail Inbound Reply Sync Results", box=box.ROUNDED)
+        table.add_column("Metric", style="cyan")
+        table.add_column("Count / Value", style="white")
+
+        table.add_row("Sync Strategy", res.sync_mode.upper())
+        table.add_row("Messages Evaluated", str(res.messages_evaluated))
+        table.add_row("New Replies Synced", f"[green]{res.new_replies_saved}[/green]")
+        table.add_row("Matched to Outreach Leads", f"[bold green]{res.matched_count}[/bold green]")
+        table.add_row("Unmatched Inbound", f"[yellow]{res.unmatched_count}[/yellow]")
+        table.add_row("Duplicates Skipped", str(res.duplicates_skipped))
+        table.add_row("Agency Outbound Skipped", str(res.agency_sent_skipped))
+        if res.new_history_id:
+            table.add_row("Updated History Cursor", res.new_history_id)
+
+        console.print(table)
+
+        if res.preview_items:
+            console.print("\n[bold]Recent Inbound Messages:[/bold]")
+            p_table = Table(box=box.SIMPLE)
+            p_table.add_column("From", style="cyan")
+            p_table.add_column("Subject", style="white")
+            p_table.add_column("Matched Lead ID", style="magenta")
+            p_table.add_column("Snippet", style="dim")
+            for item in res.preview_items[:10]:
+                p_table.add_row(
+                    item["from_email"],
+                    item["subject"][:35],
+                    str(item["lead_id"] or "Unmatched"),
+                    item["snippet"][:40],
+                )
+            console.print(p_table)
+
+        if res.errors:
+            console.print("\n[yellow]Warnings / Errors:[/yellow]")
+            for err in res.errors:
+                console.print(f"  • {err}")
+
+    except Exception as e:
+        console.print(f"[red]Sync failed: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@replies_group.command("list")
+@click.option("--classification", "cls_filter", default=None, help="Filter by classification category")
+@click.option("--needs-review", is_flag=True, help="Show only replies flagged for human review")
+@click.option("--limit", type=int, default=20, help="Maximum replies to show")
+def replies_list_cmd(cls_filter: str | None, needs_review: bool, limit: int):
+    """List synced inbound replies and their classification states."""
+    conn = _get_conn()
+    try:
+        query = """SELECT r.*, l.business_name
+                   FROM replies r
+                   LEFT JOIN leads l ON r.lead_id = l.id
+                   WHERE 1=1"""
+        params: list = []
+
+        if cls_filter:
+            query += " AND r.classification = ?"
+            params.append(cls_filter)
+        if needs_review:
+            query += " AND r.needs_review = 1"
+
+        query += " ORDER BY r.id DESC LIMIT ?"
+        params.append(limit)
+
+        rows = conn.execute(query, params).fetchall()
+
+        if not rows:
+            console.print("[yellow]No inbound replies found matching criteria.[/yellow]")
+            return
+
+        table = Table(title="Inbound Customer Replies", box=box.ROUNDED)
+        table.add_column("ID", style="dim")
+        table.add_column("From", style="cyan")
+        table.add_column("Business", style="magenta")
+        table.add_column("Classification", style="bold", no_wrap=True)
+        table.add_column("Conf.", style="white")
+        table.add_column("Review?", style="yellow")
+        table.add_column("Received", style="dim")
+
+        for r in rows:
+            cls = r["classification"] or "pending"
+            color = "green" if cls in ("positive_interest", "meeting_request") else ("red" if cls in ("unsubscribe", "bounce_or_delivery_failure") else "white")
+            table.add_row(
+                str(r["id"]),
+                r["from_email"] or "",
+                r["business_name"] or "Unmatched",
+                f"[{color}]{cls}[/{color}]",
+                f"{r['confidence']:.2f}" if r["confidence"] else "-",
+                "[bold yellow]YES[/bold yellow]" if r["needs_review"] else "no",
+                (r["received_at"] or r["created_at"])[:16],
+            )
+
+        console.print(table)
+    finally:
+        conn.close()
+
+
+@replies_group.command("show")
+@click.argument("reply_id", type=int)
+def replies_show_cmd(reply_id: int):
+    """Inspect full details of an inbound reply, classification & suggested response."""
+    conn = _get_conn()
+    try:
+        r = conn.execute(
+            """SELECT r.*, l.business_name, l.contact_name, l.email as lead_email,
+                      m.subject as outbound_subject, m.body as outbound_body
+               FROM replies r
+               LEFT JOIN leads l ON r.lead_id = l.id
+               LEFT JOIN messages m ON r.message_id = m.id
+               WHERE r.id = ?""",
+            (reply_id,),
+        ).fetchone()
+
+        if not r:
+            console.print(f"[red]Reply ID {reply_id} not found.[/red]")
+            return
+
+        cls = r["classification"] or "unclassified"
+        cls_color = "green" if cls in ("positive_interest", "meeting_request") else ("red" if cls in ("unsubscribe", "bounce_or_delivery_failure") else "yellow")
+
+        console.print(
+            Panel(
+                f"[bold]Reply ID:[/bold] {r['id']}  |  [bold]Lead:[/bold] {r['business_name'] or 'Unmatched'} (ID: {r['lead_id'] or '-'})\n"
+                f"[bold]From:[/bold] {r['from_email']}\n"
+                f"[bold]To:[/bold] {r['to_email']}\n"
+                f"[bold]Subject:[/bold] {r['subject']}\n"
+                f"[bold]Received:[/bold] {r['received_at'] or r['created_at']}\n"
+                f"[bold]Classification:[/bold] [{cls_color}]{cls.upper()}[/{cls_color}]  |  "
+                f"[bold]Confidence:[/bold] {r['confidence'] or 0:.2f}  |  "
+                f"[bold]Review Required:[/bold] {'[bold red]YES[/bold red]' if r['needs_review'] else 'No'}\n"
+                f"[bold]Explanation:[/bold] {r['explanation'] or 'Not classified yet'}",
+                title="Inbound Reply Metadata",
+                border_style=cls_color,
+            )
+        )
+
+        console.print(
+            Panel(
+                r["body"] or "[No body content]",
+                title="Customer Reply Body",
+                border_style="cyan",
+            )
+        )
+
+        if r["suggested_reply"]:
+            console.print(
+                Panel(
+                    r["suggested_reply"],
+                    title=f"Suggested Response Draft (Status: {r['suggested_reply_status']})",
+                    border_style="green",
+                )
+            )
+
+        if r["outbound_subject"]:
+            console.print(
+                Panel(
+                    f"[bold]Subject:[/bold] {r['outbound_subject']}\n\n"
+                    f"{r['outbound_body'][:300]}...",
+                    title="Original Outbound Context",
+                    border_style="dim",
+                )
+            )
+
+    finally:
+        conn.close()
+
+
+@replies_group.command("classify")
+@click.option("--pending", is_flag=True, help="Classify all pending unclassified replies")
+@click.option("--reply-id", type=int, default=None, help="Classify a specific reply ID")
+@click.option("--no-ai", is_flag=True, help="Use deterministic rules only without LLM")
+def replies_classify_cmd(pending: bool, reply_id: int | None, no_ai: bool):
+    """Run reply classification agent on pending or specific inbound messages."""
+    conn = _get_conn()
+    try:
+        if reply_id:
+            res = classify_reply(conn, reply_id, use_ai=not no_ai)
+            color = "green" if res.category in ("positive_interest", "meeting_request") else "white"
+            console.print(
+                Panel(
+                    f"[bold]Category:[/bold] [{color}]{res.category.upper()}[/{color}]\n"
+                    f"[bold]Confidence:[/bold] {res.confidence:.2f}\n"
+                    f"[bold]Explanation:[/bold] {res.explanation}\n"
+                    f"[bold]Review Required:[/bold] {'YES' if res.needs_review else 'No'}\n"
+                    f"[bold]Suggested Reply:[/bold] {'Generated' if res.suggested_reply else 'None'}",
+                    title=f"Classification Result for Reply #{reply_id}",
+                    border_style="green",
+                )
+            )
+            return
+
+        # Batch classify pending
+        res_batch = classify_pending_replies(conn, use_ai=not no_ai)
+        console.print(
+            Panel(
+                f"[bold]Evaluated:[/bold] {res_batch['total_evaluated']}\n"
+                f"[bold]Successfully Classified:[/bold] [green]{res_batch['processed']}[/green]\n"
+                f"[bold]Flagged for Review:[/bold] [yellow]{res_batch['needs_review_count']}[/yellow]\n\n"
+                + "\n".join(f"  • {cat}: {cnt}" for cat, cnt in res_batch["by_category"].items()),
+                title="Batch Classification Results",
+                border_style="green",
+            )
+        )
+    finally:
+        conn.close()
+
+
+@replies_group.command("review")
+@click.argument("reply_id", type=int)
+@click.option("--override-class", type=click.Choice(CLASSIFICATION_CATEGORIES), help="Manually override category")
+@click.option("--approve-reply", is_flag=True, help="Approve the suggested reply draft for outbound sending")
+@click.option("--reply-text", help="Provide edited response body text")
+def replies_review_cmd(reply_id: int, override_class: str | None, approve_reply: bool, reply_text: str | None):
+    """Review, override classification, and approve suggested reply drafts."""
+    conn = _get_conn()
+    try:
+        row = conn.execute("SELECT * FROM replies WHERE id = ?", (reply_id,)).fetchone()
+        if not row:
+            console.print(f"[red]Reply ID {reply_id} not found.[/red]")
+            return
+
+        with transaction(conn):
+            if override_class:
+                conn.execute(
+                    """UPDATE replies SET
+                       classification = ?,
+                       needs_review = 0,
+                       explanation = 'Manually reviewed and updated via CLI',
+                       processed_at = datetime('now')
+                       WHERE id = ?""",
+                    (override_class, reply_id),
+                )
+                console.print(f"[green]✓ Updated classification to {override_class}[/green]")
+
+            if reply_text:
+                conn.execute(
+                    "UPDATE replies SET suggested_reply = ? WHERE id = ?",
+                    (reply_text, reply_id),
+                )
+                console.print("[green]✓ Updated suggested reply text.[/green]")
+
+            if approve_reply:
+                current_text = reply_text or row["suggested_reply"]
+                if not current_text:
+                    console.print("[red]Cannot approve: No suggested reply text exists for this reply.[/red]")
+                    return
+
+                # Create outreach message draft in messages table
+                lead_id = row["lead_id"]
+                if not lead_id:
+                    console.print("[red]Cannot create outbound draft: Reply is not matched to a lead.[/red]")
+                    return
+
+                cur = conn.execute(
+                    """INSERT INTO messages (
+                       lead_id, recipient, subject, body, message_type,
+                       status, quality_status, provider
+                    ) VALUES (?, ?, ?, ?, 'reply', 'approved', 'approved', 'human_approved')""",
+                    (
+                        lead_id,
+                        row["from_email"],
+                        f"Re: {row['subject'] or 'Your inquiry'}",
+                        current_text,
+                    ),
+                )
+                new_msg_id = cur.lastrowid
+                conn.execute(
+                    "UPDATE replies SET suggested_reply_status = 'approved', needs_review = 0 WHERE id = ?",
+                    (reply_id,),
+                )
+                console.print(
+                    Panel(
+                        f"[green]✓ Reply approved![/green]\n"
+                        f"Created approved outbound message [bold]#{new_msg_id}[/bold].\n"
+                        f"Dispatch via: [cyan]salesos outreach send {new_msg_id}[/cyan]",
+                        title="Reply Draft Approved",
+                        border_style="green",
+                    )
+                )
+
+    finally:
+        conn.close()
+
+
+@replies_group.command("status")
+def replies_status_cmd():
+    """Display inbound reply intelligence metrics and review queue."""
+    conn = _get_conn()
+    try:
+        by_class = {}
+        for r in conn.execute("SELECT classification, count(*) as cnt FROM replies GROUP BY classification"):
+            by_class[r["classification"] or "unclassified"] = r["cnt"]
+
+        review_count = conn.execute("SELECT count(*) FROM replies WHERE needs_review = 1").fetchone()[0]
+        total_replies = conn.execute("SELECT count(*) FROM replies").fetchone()[0]
+        checkpoint = get_last_checkpoint(conn)
+
+        table_cats = Table(box=box.ROUNDED)
+        table_cats.add_column("Category", style="cyan")
+        table_cats.add_column("Count", style="white")
+
+        for cat, cnt in sorted(by_class.items()):
+            color = "green" if cat in ("positive_interest", "meeting_request") else ("red" if cat in ("unsubscribe", "bounce_or_delivery_failure") else "white")
+            table_cats.add_row(f"[{color}]{cat}[/{color}]", str(cnt))
+
+        console.print("[bold]Inbound Reply Intelligence Overview[/bold]")
+        console.print(
+            Panel(
+                f"[bold]Total Replies Processed:[/bold] {total_replies}\n"
+                f"[bold]Pending Human Review:[/bold] [bold yellow]{review_count}[/bold yellow]\n"
+                f"[bold]Last Sync Time:[/bold] {checkpoint['last_sync_at'] if checkpoint else 'Never'}\n"
+                f"[bold]Gmail History Cursor:[/bold] {checkpoint['last_history_id'] if checkpoint else 'None'}",
+                title="Reply Synchronization Health",
+                border_style="green",
+            )
+        )
+        console.print(table_cats)
+    finally:
+        conn.close()
+
+
+# ── Follow-Ups Group ─────────────────────────────────────────────────
+
+@cli.group("followups")
+def followups_group():
+    """Human-controlled follow-up planning and scheduling engine."""
+
+
+@followups_group.command("plan")
+@click.option("--limit", type=int, default=50, help="Maximum leads to evaluate for follow-up")
+def followups_plan_cmd(limit: int):
+    """Scan contacted non-responsive leads and schedule follow-up steps."""
+    conn = _get_conn()
+    try:
+        res = plan_followups(conn, max_leads=limit)
+        console.print(
+            Panel(
+                f"[bold]Leads Evaluated:[/bold] {res['leads_evaluated']}\n"
+                f"[bold]New Follow-Ups Scheduled:[/bold] [green]{res['planned_count']}[/green]\n"
+                f"[bold]Skipped (Replied/Suppressed):[/bold] [yellow]{res['skipped_count']}[/yellow]",
+                title="Follow-Up Sequence Planner",
+                border_style="green",
+            )
+        )
+    finally:
+        conn.close()
+
+
+@followups_group.command("due")
+def followups_due_cmd():
+    """List scheduled follow-ups that have reached their due date."""
+    conn = _get_conn()
+    try:
+        due_list = get_due_followups(conn)
+        if not due_list:
+            console.print("[green]✓ No follow-ups currently due for review.[/green]")
+            return
+
+        table = Table(title="Follow-Ups Due for Human Review", box=box.ROUNDED)
+        table.add_column("Follow-Up ID", style="dim")
+        table.add_column("Business", style="cyan")
+        table.add_column("Recipient", style="white")
+        table.add_column("Step", style="magenta")
+        table.add_column("Due Date", style="yellow")
+        table.add_column("Draft Msg ID", style="bold")
+
+        for r in due_list:
+            table.add_row(
+                str(r["id"]),
+                r["business_name"] or "Unknown",
+                r["recipient"] or "",
+                f"Step {r['followup_number']}",
+                r["due_date"][:16],
+                f"#{r['generated_message_id']}" if r["generated_message_id"] else "None",
+            )
+
+        console.print(table)
+        console.print("\n[dim]To preview draft: salesos followups preview <ID>[/dim]")
+        console.print("[dim]To authorize dispatch: salesos followups approve <ID>[/dim]")
+    finally:
+        conn.close()
+
+
+@followups_group.command("preview")
+@click.argument("followup_id", type=int)
+def followups_preview_cmd(followup_id: int):
+    """Preview follow-up schedule details and generated draft message."""
+    conn = _get_conn()
+    try:
+        r = conn.execute(
+            """SELECT f.*, m.subject, m.body, m.status as msg_status,
+                      l.business_name, l.contact_name, l.email as lead_email
+               FROM followups f
+               LEFT JOIN messages m ON f.generated_message_id = m.id
+               LEFT JOIN leads l ON f.lead_id = l.id
+               WHERE f.id = ?""",
+            (followup_id,),
+        ).fetchone()
+
+        if not r:
+            console.print(f"[red]Follow-up ID {followup_id} not found.[/red]")
+            return
+
+        status_color = "green" if r["status"] == "approved" else ("red" if r["status"] == "cancelled" else "yellow")
+
+        console.print(
+            Panel(
+                f"[bold]Follow-Up ID:[/bold] {r['id']}  |  [bold]Lead:[/bold] {r['business_name']} (ID: {r['lead_id']})\n"
+                f"[bold]Step Number:[/bold] {r['followup_number']}  |  [bold]Status:[/bold] [{status_color}]{r['status'].upper()}[/{status_color}]\n"
+                f"[bold]Due Date:[/bold] {r['due_date']}  |  [bold]Original Msg ID:[/bold] #{r['original_message_id']}\n"
+                f"[bold]Reason:[/bold] {r['scheduled_reason']}",
+                title="Follow-Up Schedule Details",
+                border_style=status_color,
+            )
+        )
+
+        if r["body"]:
+            console.print(
+                Panel(
+                    f"[bold]Subject:[/bold] {r['subject']}\n\n"
+                    f"{r['body']}",
+                    title=f"Generated Follow-Up Draft (Message #{r['generated_message_id']})",
+                    border_style="cyan",
+                )
+            )
+        else:
+            console.print("[yellow]No draft message generated yet for this follow-up.[/yellow]")
+
+    finally:
+        conn.close()
+
+
+@followups_group.command("approve")
+@click.argument("followup_id", type=int)
+def followups_approve_cmd(followup_id: int):
+    """Approve a follow-up draft for outreach dispatch."""
+    conn = _get_conn()
+    try:
+        ok, msg = approve_followup(conn, followup_id)
+        if ok:
+            console.print(f"[green]✓ {msg}[/green]")
+        else:
+            console.print(f"[red]✗ {msg}[/red]")
+    finally:
+        conn.close()
+
+
+@followups_group.command("cancel")
+@click.argument("followup_id", type=int)
+@click.option("--reason", default="manual_cancel", help="Reason for cancellation")
+def followups_cancel_cmd(followup_id: int, reason: str):
+    """Cancel a scheduled follow-up sequence."""
+    conn = _get_conn()
+    try:
+        ok = cancel_followup(conn, followup_id, reason=reason)
+        if ok:
+            console.print(f"[green]✓ Follow-up {followup_id} cancelled.[/green]")
+        else:
+            console.print(f"[red]Follow-up {followup_id} not found.[/red]")
+    finally:
+        conn.close()
+
+
+@followups_group.command("status")
+def followups_status_cmd():
+    """Display follow-up automation metrics and cadence settings."""
+    conn = _get_conn()
+    try:
+        s = get_followups_status(conn)
+        tbl = Table(title="Follow-Up Automation Pipeline", box=box.ROUNDED)
+        tbl.add_column("Metric / Status", style="cyan")
+        tbl.add_column("Value", style="white")
+
+        by_st = s["followups_by_status"]
+        tbl.add_row("Scheduled Ahead", str(by_st.get("scheduled", 0) + by_st.get("planned", 0)))
+        tbl.add_row("Due for Review Today", f"[bold yellow]{s['due_for_review']}[/bold yellow]")
+        tbl.add_row("Approved for Sending", f"[green]{by_st.get('approved', 0)}[/green]")
+        tbl.add_row("Successfully Sent", f"[bold green]{by_st.get('sent', 0)}[/bold green]")
+        tbl.add_row("Cancelled (Replied/Opt-Out)", str(by_st.get("cancelled", 0)))
+
+        tbl.add_section()
+        tbl.add_row("Step 1 Delay", f"{s['step1_delay_days']} business days")
+        tbl.add_row("Step 2 Delay", f"{s['step2_delay_days']} business days")
+        tbl.add_row("Max Steps per Campaign", f"{s['max_steps']} follow-ups")
+
+        console.print(tbl)
+    finally:
+        conn.close()
+
+
+# ── Leads Group & CRM Timeline ───────────────────────────────────────
+
+@cli.group("leads")
+def leads_group():
+    """Lead records and CRM timeline commands."""
+
+
+@leads_group.command("timeline")
+@click.argument("lead_id", type=int)
+def leads_timeline_cmd(lead_id: int):
+    """Display comprehensive chronological CRM conversation timeline for a lead."""
+    conn = _get_conn()
+    try:
+        data = get_lead_timeline(conn, lead_id)
+
+        console.print(
+            Panel(
+                f"[bold]Lead ID:[/bold] {data['lead_id']}  |  [bold]Business:[/bold] {data['business_name']}\n"
+                f"[bold]Contact:[/bold] {data['contact_name'] or 'Unknown'}  |  [bold]Email:[/bold] {data['email']}\n"
+                f"[bold]Website:[/bold] {data['website'] or 'None'}  |  [bold]Status:[/bold] {data['status'].upper()}  |  "
+                f"[bold]Qualification Score:[/bold] {data['score'] or 0:.1f}",
+                title=f"CRM Timeline: {data['business_name']}",
+                border_style="cyan",
+            )
+        )
+
+        table = Table(box=box.ROUNDED)
+        table.add_column("Timestamp", style="dim", no_wrap=True)
+        table.add_column("Event Type", style="cyan", no_wrap=True)
+        table.add_column("Title & Details", style="white")
+
+        badge_colors = {
+            "info": "blue",
+            "success": "green",
+            "warning": "yellow",
+            "error": "red",
+            "draft": "magenta",
+            "reply": "bold green",
+        }
+
+        for ev in data["events"]:
+            b_color = badge_colors.get(ev.get("badge", "info"), "white")
+            table.add_row(
+                ev["timestamp"][:19],
+                f"[{b_color}]{ev['type']}[/{b_color}]",
+                f"[bold]{ev['title']}[/bold]\n[dim]{ev['description']}[/dim]",
+            )
+
+        console.print(table)
+    except Exception as e:
+        console.print(f"[red]Error displaying timeline: {e}[/red]")
     finally:
         conn.close()
 

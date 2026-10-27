@@ -150,22 +150,69 @@ CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status);
 CREATE TABLE IF NOT EXISTS replies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id INTEGER REFERENCES messages(id),
-    lead_id INTEGER NOT NULL REFERENCES leads(id),
-    classification TEXT
-        CHECK (classification IN (
-            'interested', 'not_interested', 'objection', 'referral',
-            'out_of_office', 'unsubscribe', 'bounce', 'other'
-        )),
+    lead_id INTEGER REFERENCES leads(id),
+    classification TEXT,
     subject TEXT,
     body TEXT,
     raw_headers TEXT,
     received_at TEXT,
     processed_at TEXT,
+    gmail_message_id TEXT,
+    gmail_thread_id TEXT,
+    from_email TEXT,
+    to_email TEXT,
+    confidence REAL,
+    explanation TEXT,
+    needs_review INTEGER DEFAULT 0,
+    classifier_version TEXT,
+    evidence_references TEXT,
+    suggested_reply TEXT,
+    suggested_reply_status TEXT DEFAULT 'pending',
+    meeting_details TEXT,
+    is_classified INTEGER DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_replies_lead ON replies(lead_id);
 CREATE INDEX IF NOT EXISTS idx_replies_message ON replies(message_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_replies_gmail_msg ON replies(gmail_message_id);
+
+-- ============================================================
+-- Synchronization checkpoints
+-- ============================================================
+CREATE TABLE IF NOT EXISTS sync_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checkpoint_key TEXT UNIQUE NOT NULL,
+    last_history_id TEXT,
+    last_sync_at TEXT,
+    messages_synced INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'success',
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ============================================================
+-- Follow-up schedules
+-- ============================================================
+CREATE TABLE IF NOT EXISTS followups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER NOT NULL REFERENCES leads(id),
+    original_message_id INTEGER NOT NULL REFERENCES messages(id),
+    followup_number INTEGER NOT NULL DEFAULT 1,
+    due_date TEXT NOT NULL,
+    status TEXT DEFAULT 'scheduled'
+        CHECK (status IN ('scheduled', 'planned', 'approved', 'sent', 'cancelled', 'skipped')),
+    scheduled_reason TEXT,
+    cancel_reason TEXT,
+    generated_message_id INTEGER REFERENCES messages(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_followup_lead_step ON followups(lead_id, followup_number);
+CREATE INDEX IF NOT EXISTS idx_followup_due ON followups(due_date, status);
+CREATE INDEX IF NOT EXISTS idx_followup_lead ON followups(lead_id);
 
 -- ============================================================
 -- Suppression list (opt-outs, bounces, invalids)
@@ -268,9 +315,37 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
             except sqlite3.OperationalError:
                 pass
 
+    # Migrate replies table
+    cur_replies = conn.execute("PRAGMA table_info(replies)")
+    replies_cols = {row["name"] for row in cur_replies.fetchall()}
+    replies_migrations = [
+        ("gmail_message_id", "ALTER TABLE replies ADD COLUMN gmail_message_id TEXT"),
+        ("gmail_thread_id", "ALTER TABLE replies ADD COLUMN gmail_thread_id TEXT"),
+        ("from_email", "ALTER TABLE replies ADD COLUMN from_email TEXT"),
+        ("to_email", "ALTER TABLE replies ADD COLUMN to_email TEXT"),
+        ("confidence", "ALTER TABLE replies ADD COLUMN confidence REAL"),
+        ("explanation", "ALTER TABLE replies ADD COLUMN explanation TEXT"),
+        ("needs_review", "ALTER TABLE replies ADD COLUMN needs_review INTEGER DEFAULT 0"),
+        ("classifier_version", "ALTER TABLE replies ADD COLUMN classifier_version TEXT"),
+        ("evidence_references", "ALTER TABLE replies ADD COLUMN evidence_references TEXT"),
+        ("suggested_reply", "ALTER TABLE replies ADD COLUMN suggested_reply TEXT"),
+        ("suggested_reply_status", "ALTER TABLE replies ADD COLUMN suggested_reply_status TEXT DEFAULT 'pending'"),
+        ("meeting_details", "ALTER TABLE replies ADD COLUMN meeting_details TEXT"),
+        ("is_classified", "ALTER TABLE replies ADD COLUMN is_classified INTEGER DEFAULT 0"),
+    ]
+    for col_name, sql in replies_migrations:
+        if col_name not in replies_cols:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass
+
     try:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_idempotency ON messages(idempotency_key)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_replies_gmail_msg ON replies(gmail_message_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_classification ON replies(classification)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_needs_review ON replies(needs_review)")
     except sqlite3.OperationalError:
         pass
 

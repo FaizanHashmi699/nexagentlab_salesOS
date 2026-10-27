@@ -32,6 +32,7 @@ DEFAULT_SCOPES = [
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/gmail.readonly",
 ]
 
 
@@ -58,6 +59,14 @@ class AmbiguousSendError(GmailError):
     """Raised when a network failure occurs during send and delivery state is uncertain."""
 
 
+class HistoryExpiredError(GmailError):
+    """Raised when startHistoryId has expired or is invalid, requiring full recovery sync."""
+
+
+class InsufficientScopeError(GmailError):
+    """Raised when required Gmail read permissions are not granted."""
+
+
 # ── Models ───────────────────────────────────────────────────────────
 
 
@@ -75,6 +84,7 @@ class GmailStatus(BaseModel):
     authenticated_email: Optional[str] = None
     identity_matched: bool = False
     granted_scopes: list[str] = Field(default_factory=list)
+    has_read_scope: bool = False
     dry_run: bool = True
     kill_switch_active: bool = False
     error: Optional[str] = None
@@ -484,6 +494,184 @@ def send_message_api(
     }
 
 
+# ── Inbound Message Retrieval & History Sync ─────────────────────────
+
+
+def has_readonly_scope(token_data: dict) -> bool:
+    """Check if token possesses permissions to read messages/history."""
+    scopes_raw = token_data.get("scope", "")
+    scopes = scopes_raw.split() if isinstance(scopes_raw, str) else (scopes_raw or [])
+    return any(
+        "readonly" in s or "mail.google.com" in s or "modify" in s
+        for s in scopes
+    )
+
+
+def list_inbox_messages(
+    query: str = "label:INBOX",
+    max_results: int = 50,
+    page_token: str | None = None,
+    access_token: str | None = None,
+) -> dict:
+    """Query Gmail for list of message IDs matching criteria."""
+    token = access_token or get_valid_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    params: dict[str, Any] = {"q": query, "maxResults": max_results}
+    if page_token:
+        params["pageToken"] = page_token
+
+    resp = requests.get(f"{GMAIL_API_BASE}/messages", headers=headers, params=params, timeout=20)
+    if resp.status_code == 403:
+        raise InsufficientScopeError(
+            "Access forbidden (403): Gmail read permissions missing. "
+            "Please run 'salesos gmail auth' to authorize reading inbound replies."
+        )
+    if resp.status_code != 200:
+        raise GmailError(f"Failed to list messages ({resp.status_code}): {resp.text}")
+
+    return resp.json()
+
+
+def get_history(
+    start_history_id: str,
+    max_results: int = 100,
+    page_token: str | None = None,
+    access_token: str | None = None,
+) -> dict:
+    """Retrieve incremental message events since start_history_id."""
+    token = access_token or get_valid_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    params: dict[str, Any] = {
+        "startHistoryId": str(start_history_id),
+        "maxResults": max_results,
+        "historyTypes": "messageAdded",
+    }
+    if page_token:
+        params["pageToken"] = page_token
+
+    resp = requests.get(f"{GMAIL_API_BASE}/history", headers=headers, params=params, timeout=20)
+    if resp.status_code == 404:
+        raise HistoryExpiredError(
+            f"History ID {start_history_id} has expired or is outside Google's retention window. "
+            "Full recovery sync required."
+        )
+    if resp.status_code == 403:
+        raise InsufficientScopeError("Access forbidden (403): Read permissions missing.")
+    if resp.status_code != 200:
+        raise GmailError(f"Failed to fetch Gmail history ({resp.status_code}): {resp.text}")
+
+    return resp.json()
+
+
+def get_message_detail(
+    message_id: str,
+    access_token: str | None = None,
+) -> dict:
+    """Fetch complete raw message payload by ID."""
+    token = access_token or get_valid_access_token()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = requests.get(
+        f"{GMAIL_API_BASE}/messages/{message_id}",
+        headers=headers,
+        params={"format": "full"},
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        raise GmailError(f"Failed to fetch message {message_id} ({resp.status_code}): {resp.text}")
+
+    return resp.json()
+
+
+def _decode_body_data(data_b64: str) -> str:
+    """Safely decode base64url message part body."""
+    try:
+        # Standardize padding
+        rem = len(data_b64) % 4
+        if rem > 0:
+            data_b64 += "=" * (4 - rem)
+        decoded_bytes = base64.urlsafe_b64decode(data_b64)
+        return decoded_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def parse_gmail_message(data: dict) -> dict:
+    """Extract standard fields, headers, and clean body text from Gmail API JSON."""
+    msg_id = data.get("id", "")
+    thread_id = data.get("threadId", "")
+    history_id = data.get("historyId", "")
+    snippet = data.get("snippet", "")
+
+    headers_list = data.get("payload", {}).get("headers", [])
+    headers: dict[str, str] = {}
+    for h in headers_list:
+        headers[h.get("name", "").lower()] = h.get("value", "")
+
+    from_header = headers.get("from", "")
+    to_header = headers.get("to", "")
+    subject = headers.get("subject", "")
+    date_str = headers.get("date", "")
+    in_reply_to = headers.get("in-reply-to", "")
+    references = headers.get("references", "")
+    message_id_header = headers.get("message-id", "")
+
+    # Extract clean email address from "From: Name <email@domain.com>"
+    import re
+    email_match = re.search(r"<([^>]+)>", from_header)
+    clean_from_email = email_match.group(1).strip().lower() if email_match else from_header.strip().lower()
+
+    # Extract body text from payload
+    body_text = ""
+    payload = data.get("payload", {})
+
+    def extract_from_part(part: dict) -> str:
+        mime_type = part.get("mimeType", "")
+        data_b64 = part.get("body", {}).get("data", "")
+
+        if mime_type == "text/plain" and data_b64:
+            return _decode_body_data(data_b64)
+
+        if "parts" in part:
+            for subpart in part["parts"]:
+                txt = extract_from_part(subpart)
+                if txt:
+                    return txt
+
+        # Fallback to html if plain not found
+        if mime_type == "text/html" and data_b64:
+            raw_html = _decode_body_data(data_b64)
+            # Basic tag stripping
+            clean = re.sub(r"<[^>]+>", " ", raw_html)
+            return " ".join(clean.split())
+
+        return ""
+
+    body_text = extract_from_part(payload)
+    if not body_text and payload.get("body", {}).get("data"):
+        body_text = _decode_body_data(payload["body"]["data"])
+
+    if not body_text:
+        body_text = snippet
+
+    return {
+        "gmail_message_id": msg_id,
+        "gmail_thread_id": thread_id,
+        "history_id": history_id,
+        "from_email": clean_from_email,
+        "from_header": from_header,
+        "to_email": to_header,
+        "subject": subject,
+        "date": date_str,
+        "in_reply_to": in_reply_to,
+        "references": references,
+        "message_id_header": message_id_header,
+        "body": body_text.strip(),
+        "snippet": snippet,
+        "raw_headers": json.dumps(headers),
+    }
+
+
 # ── Status Query ─────────────────────────────────────────────────────
 
 
@@ -526,6 +714,10 @@ def get_gmail_status() -> GmailStatus:
             status.granted_scopes = scopes_raw.split()
         elif isinstance(scopes_raw, list):
             status.granted_scopes = scopes_raw
+        status.has_read_scope = any(
+            "readonly" in s or "mail.google.com" in s or "modify" in s
+            for s in status.granted_scopes
+        )
 
         # Check sender identity if token is valid
         if status.token_valid:
