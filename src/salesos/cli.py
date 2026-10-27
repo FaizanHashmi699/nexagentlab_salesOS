@@ -114,6 +114,11 @@ from .meetings import (
     sync_calendly_events,
     update_meeting,
 )
+from .health_check import (
+    CheckStatus,
+    ReadinessLevel,
+    run_all_health_checks,
+)
 
 # Force UTF-8 to avoid cp1252 encoding errors with Rich on Windows
 import sys
@@ -2561,6 +2566,113 @@ def pipeline_export_cmd(filepath: str, fmt: str):
     finally:
         conn.close()
 
+
+
+# ── Integrations & Health Check CLI (Acceptance Audit) ───────────────────
+
+
+@cli.group("integrations")
+def integrations_group():
+    """Integration audit, health checks, and acceptance testing."""
+    pass
+
+
+@integrations_group.command("status")
+def integrations_status_cmd():
+    """Display quick status of all external and internal integrations."""
+    report = run_all_health_checks(live=False)
+
+    badge_styles = {
+        CheckStatus.PASS: "green",
+        CheckStatus.FAIL: "red",
+        CheckStatus.NOT_CONFIGURED: "yellow",
+        CheckStatus.SKIPPED: "dim",
+        CheckStatus.BLOCKED: "bold red",
+        CheckStatus.NOT_IMPLEMENTED: "magenta",
+    }
+
+    table = Table(title="NexAgentLab SalesOS — Integration Status", box=box.ROUNDED)
+    table.add_column("Component", style="bold")
+    table.add_column("Status", justify="center")
+    table.add_column("Summary")
+
+    for check in report.checks:
+        color = badge_styles.get(check.status, "white")
+        table.add_row(
+            check.component,
+            f"[{color}][bold]{check.status.value}[/bold][/{color}]",
+            check.summary,
+        )
+
+    console.print(table)
+    readiness_color = "green" if report.readiness == ReadinessLevel.READY_FOR_CONTROLLED_PILOT else "yellow" if report.readiness == ReadinessLevel.READY_FOR_LOCAL_TESTING_ONLY else "red"
+    console.print(Panel(f"[bold]System Readiness Level:[/bold] [{readiness_color}][bold]{report.readiness.value}[/bold][/{readiness_color}]", border_style=readiness_color))
+
+
+@integrations_group.command("check")
+@click.option("--live", is_flag=True, default=False, help="Perform safe, read-only live network connectivity probes.")
+@click.option("--read-only", is_flag=True, default=True, help="Enforce strictly read-only checks without side effects.")
+@click.option("--json", "json_path", type=click.Path(), default=None, help="Save detailed JSON health report to file.")
+@click.option("--md", "md_path", type=click.Path(), default=None, help="Save formatted Markdown acceptance report to file.")
+def integrations_check_cmd(live: bool, read_only: bool, json_path: str | None, md_path: str | None):
+    """Run comprehensive integration health checks and acceptance audit."""
+    mode_str = "Live Probe Mode" if live else "Local Safe Mode"
+    console.print(f"[cyan]Running integration health checks in [bold]{mode_str}[/bold] (read-only={read_only})...[/cyan]")
+
+    report = run_all_health_checks(live=live)
+
+    badge_styles = {
+        CheckStatus.PASS: "green",
+        CheckStatus.FAIL: "red",
+        CheckStatus.NOT_CONFIGURED: "yellow",
+        CheckStatus.SKIPPED: "dim",
+        CheckStatus.BLOCKED: "bold red",
+        CheckStatus.NOT_IMPLEMENTED: "magenta",
+    }
+
+    table = Table(title=f"Integration Health Check Results ({mode_str})", box=box.ROUNDED)
+    table.add_column("Component", style="bold")
+    table.add_column("Status", justify="center")
+    table.add_column("Summary")
+    table.add_column("Remediation / Note")
+
+    for check in report.checks:
+        color = badge_styles.get(check.status, "white")
+        table.add_row(
+            check.component,
+            f"[{color}][bold]{check.status.value}[/bold][/{color}]",
+            check.summary,
+            check.remediation or "[dim]None[/dim]",
+        )
+
+    console.print(table)
+
+    readiness_color = "green" if report.readiness == ReadinessLevel.READY_FOR_CONTROLLED_PILOT else "yellow" if report.readiness == ReadinessLevel.READY_FOR_LOCAL_TESTING_ONLY else "red"
+    console.print(
+        Panel(
+            f"[bold]Readiness Classification:[/bold] [{readiness_color}][bold]{report.readiness.value}[/bold][/{readiness_color}]\n"
+            f"[bold]Evaluated At:[/bold] {report.timestamp}\n"
+            f"[bold]Mode:[/bold] {'Live Network Enabled' if live else 'Safe Offline / Local'}",
+            title="Acceptance Verdict",
+            border_style=readiness_color,
+        )
+    )
+
+    if json_path:
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                f.write(report.to_json())
+            console.print(f"[green]Saved JSON report to '{json_path}'.[/green]")
+        except Exception as e:
+            console.print(f"[yellow]Could not write JSON report to '{json_path}': {e}[/yellow]")
+
+    if md_path:
+        try:
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(report.to_markdown())
+            console.print(f"[green]Saved Markdown report to '{md_path}'.[/green]")
+        except Exception as e:
+            console.print(f"[yellow]Could not write Markdown report to '{md_path}': {e}[/yellow]")
 
 
 # ── Entry point ──────────────────────────────────────────────────────

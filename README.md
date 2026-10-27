@@ -12,6 +12,7 @@
 🟢 **Milestone 4** — Gmail OAuth Integration & Controlled Outreach  
 🟢 **Milestone 5** — Reply Intelligence, Classification & Follow-up Automation  
 🟢 **Milestone 6** — Meeting Management, Sales Pipeline & Deal Intelligence  
+🟢 **Acceptance Audit** — Full Integration Audit, Security Injections & E2E Acceptance (252 tests)  
 
 ## Quick Start (Windows)
 
@@ -273,11 +274,27 @@ salesos pipeline export data/exports/pipeline.csv
 salesos pipeline export data/exports/pipeline.json --format json
 ```
 
-### 11. Run Tests
+### 11. Integration Health Checks & Pre-Flight Audit
+
+```powershell
+# Display high-level readiness status across all 7 integration components
+salesos integrations status
+
+# Run deep read-only health checks across all integrations
+salesos integrations check
+
+# Run live connectivity probe (includes external HTTPS socket checks with 3s timeout)
+salesos integrations check --live
+
+# Export health audit to structured JSON or Markdown reports
+salesos integrations check --json reports/health.json --md reports/health.md
+```
+
+### 12. Run Tests
 
 ```powershell
 pytest tests/ -v
-# Total tests: 222 passed (100% pass rate, zero regressions across Milestones 1–6)
+# Total tests: 252 passed (100% pass rate, zero regressions across Milestones 1–6)
 ```
 
 ## Google Cloud OAuth Setup (Zero Paid Services)
