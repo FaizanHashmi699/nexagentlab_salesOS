@@ -254,6 +254,12 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
         ("provider", "ALTER TABLE messages ADD COLUMN provider TEXT"),
         ("model", "ALTER TABLE messages ADD COLUMN model TEXT"),
         ("validation_errors", "ALTER TABLE messages ADD COLUMN validation_errors TEXT"),
+        ("gmail_draft_id", "ALTER TABLE messages ADD COLUMN gmail_draft_id TEXT"),
+        ("gmail_message_id", "ALTER TABLE messages ADD COLUMN gmail_message_id TEXT"),
+        ("gmail_thread_id", "ALTER TABLE messages ADD COLUMN gmail_thread_id TEXT"),
+        ("error_message", "ALTER TABLE messages ADD COLUMN error_message TEXT"),
+        ("approved_at", "ALTER TABLE messages ADD COLUMN approved_at TEXT"),
+        ("idempotency_key", "ALTER TABLE messages ADD COLUMN idempotency_key TEXT"),
     ]
     for col_name, sql in migrations:
         if col_name not in columns:
@@ -261,6 +267,12 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
                 conn.execute(sql)
             except sqlite3.OperationalError:
                 pass
+
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_idempotency ON messages(idempotency_key)")
+    except sqlite3.OperationalError:
+        pass
 
 
 def init_db(db_path: str | None = None) -> sqlite3.Connection:

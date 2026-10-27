@@ -41,6 +41,32 @@ from .personalizer import (
     personalize_lead,
     run_personalization_batch,
 )
+from .gmail_client import (
+    exchange_code_for_token,
+    generate_auth_url,
+    get_credentials_path,
+    get_gmail_status,
+    get_token_path,
+    load_credentials_file,
+    redact_secret,
+    save_token_file,
+    verify_sender_identity,
+)
+from .outreach import (
+    approve_message,
+    get_outreach_status,
+    preview_message,
+    queue_messages,
+    send_batch,
+    send_outreach_message,
+    sync_drafts_to_gmail,
+)
+from .suppression import (
+    get_suppression_stats,
+    is_email_suppressed,
+    list_suppressions,
+    record_suppression,
+)
 
 # Force UTF-8 to avoid cp1252 encoding errors with Rich on Windows
 import sys
@@ -895,6 +921,423 @@ def drafts_export_cmd(output: str, fmt: str, status_filter: str):
             console.print("[yellow]No drafts found matching the export filter.[/yellow]")
         else:
             console.print(f"[green]✓ Exported {count} drafts to {output}[/green]")
+    finally:
+        conn.close()
+
+
+# ── Gmail Group ──────────────────────────────────────────────────────
+
+@cli.group("gmail")
+def gmail_group():
+    """Gmail OAuth & account configuration management."""
+
+
+@gmail_group.command("status")
+def gmail_status_cmd():
+    """Check Gmail OAuth credentials, token status, and sender identity."""
+    status = get_gmail_status()
+
+    table = Table(title="Gmail Integration Status", box=box.ROUNDED)
+    table.add_column("Property", style="cyan", no_wrap=True)
+    table.add_column("Value", style="white")
+
+    table.add_row(
+        "Credentials File",
+        f"[green]✓ Found[/green] ({status.credentials_path})"
+        if status.credentials_found
+        else f"[yellow]✗ Missing[/yellow] ({status.credentials_path})",
+    )
+    table.add_row(
+        "Token File",
+        f"[green]✓ Found[/green] ({status.token_path})"
+        if status.token_found
+        else f"[yellow]✗ Not Generated[/yellow] ({status.token_path})",
+    )
+    table.add_row(
+        "Token State",
+        "[green]Valid & Active[/green]"
+        if (status.token_valid and not status.token_expired)
+        else ("[yellow]Expired (Refreshable)[/yellow]" if status.can_refresh else "[red]Missing or Invalid[/red]"),
+    )
+    table.add_row("Configured Agency Sender", f"[bold]{status.configured_sender}[/bold]")
+    table.add_row(
+        "Authenticated Account",
+        f"[green]{status.authenticated_email}[/green]"
+        if status.authenticated_email
+        else "[dim]Not Authenticated[/dim]",
+    )
+    table.add_row(
+        "Sender Identity Check",
+        "[green]✓ Verified (Match)[/green]"
+        if status.identity_matched
+        else ("[red]✗ Mismatch![/red]" if status.authenticated_email else "[yellow]Unverified[/yellow]"),
+    )
+    table.add_row(
+        "Granted Scopes",
+        "\n".join(status.granted_scopes) if status.granted_scopes else "[dim]None[/dim]",
+    )
+    table.add_row(
+        "Outreach Dispatch Mode",
+        "[yellow]DRY RUN (Safe - No Real Emails)[/yellow]"
+        if status.dry_run
+        else "[bold red]LIVE DISPATCH (Real Emails)[/bold red]",
+    )
+    table.add_row(
+        "Campaign Kill Switch",
+        "[bold red]ACTIVE (Halted)[/bold red]"
+        if status.kill_switch_active
+        else "[green]Inactive (Normal Operation)[/green]",
+    )
+
+    console.print(table)
+    if status.error:
+        console.print(f"\n[yellow]Notice:[/yellow] {status.error}")
+
+
+@gmail_group.command("auth")
+@click.option("--code", help="Authorization code returned from Google consent screen")
+@click.option("--credentials", "creds_file", type=click.Path(exists=True), help="Path to credentials.json")
+def gmail_auth_cmd(code: str | None, creds_file: str | None):
+    """Authenticate with Google OAuth 2.0 for Gmail access."""
+    from pathlib import Path
+    creds_p = Path(creds_file).resolve() if creds_file else get_credentials_path()
+
+    if not creds_p.exists():
+        console.print(
+            Panel(
+                "[bold yellow]Google OAuth credentials.json Not Found[/bold yellow]\n\n"
+                "To authenticate Gmail for NexAgentLab SalesOS:\n"
+                "1. Go to Google Cloud Console: [cyan]https://console.cloud.google.com[/cyan]\n"
+                "2. Create or select a project for NexAgentLab.\n"
+                "3. Enable the [bold]Gmail API[/bold] under APIs & Services.\n"
+                "4. Go to [bold]APIs & Services > OAuth consent screen[/bold], set User Type to External,\n"
+                "   and add test user: [bold]nexagentlab.tech@gmail.com[/bold].\n"
+                "5. Go to [bold]Credentials > Create Credentials > OAuth client ID[/bold].\n"
+                "6. Select Application type: [bold]Desktop app[/bold].\n"
+                "7. Download the JSON file and save it as [bold]credentials.json[/bold] in the project root.\n\n"
+                f"[dim]Expected location: {creds_p}[/dim]",
+                title="Gmail OAuth Setup Guide",
+                border_style="yellow",
+            )
+        )
+        return
+
+    try:
+        client_info = load_credentials_file(creds_p)
+    except Exception as e:
+        console.print(f"[red]Error loading credentials file: {e}[/red]")
+        return
+
+    if not code:
+        auth_url = generate_auth_url(client_info)
+        console.print(
+            Panel(
+                "[bold green]Google OAuth Authorization Required[/bold green]\n\n"
+                "1. Open this URL in your web browser:\n\n"
+                f"[cyan underline]{auth_url}[/cyan underline]\n\n"
+                "2. Sign in with [bold]nexagentlab.tech@gmail.com[/bold] and grant permissions.\n"
+                "3. Copy the authorization code provided after sign-in.\n"
+                "4. Run:\n\n"
+                "   [bold]salesos gmail auth --code YOUR_CODE_HERE[/bold]",
+                title="Google OAuth Step 1",
+                border_style="green",
+            )
+        )
+        return
+
+    # Exchange code for token
+    console.print("[dim]Exchanging authorization code for OAuth tokens...[/dim]")
+    try:
+        token_data = exchange_code_for_token(client_info, code)
+        token_path = save_token_file(token_data)
+
+        # Check sender profile identity
+        auth_email = verify_sender_identity(token_data.get("access_token"))
+        redacted_access = redact_secret(token_data.get("access_token"))
+
+        console.print(
+            Panel(
+                f"[green]✓ Successfully authenticated with Gmail![/green]\n\n"
+                f"[bold]Account:[/bold] {auth_email}\n"
+                f"[bold]Token Path:[/bold] {token_path}\n"
+                f"[bold]Access Token:[/bold] {redacted_access}\n"
+                f"[bold]Refresh Token:[/bold] [green]Stored securely[/green]",
+                title="Authentication Successful",
+                border_style="green",
+            )
+        )
+    except Exception as e:
+        console.print(f"[red]Authentication failed: {e}[/red]")
+
+
+# ── Outreach Group ───────────────────────────────────────────────────
+
+@cli.group("outreach")
+def outreach_group():
+    """Controlled outreach dispatch, approval, and suppression."""
+
+
+@outreach_group.command("preview")
+@click.argument("message_id", type=int)
+def outreach_preview_cmd(message_id: int):
+    """Preview an outreach message and run pre-flight safety checklist."""
+    conn = _get_conn()
+    try:
+        p = preview_message(conn, message_id)
+
+        border = "green" if p["status"] in ("approved", "queued") else "yellow"
+        console.print(
+            Panel(
+                f"[bold]Message ID:[/bold] {p['message_id']}  |  [bold]Lead ID:[/bold] {p['lead_id']}\n"
+                f"[bold]Business:[/bold] {p['business_name']} ({p['website'] or 'No website'})\n"
+                f"[bold]To:[/bold] {p['recipient']}\n"
+                f"[bold]Service Focus:[/bold] {p['selected_service']} (Score: {p['qualification_score'] or 0:.1f})\n"
+                f"[bold]Status:[/bold] [{border}]{p['status'].upper()}[/{border}]  |  "
+                f"[bold]Quality Gate:[/bold] {p['quality_status']}\n"
+                f"[dim]Gmail Draft ID: {p.get('gmail_draft_id') or 'Not synced'} | Sent: {p.get('sent_at') or 'No'}[/dim]",
+                title="Outreach Draft Metadata",
+                border_style=border,
+            )
+        )
+
+        console.print(
+            Panel(
+                f"[bold]Subject:[/bold] {p['subject']}\n\n"
+                f"{p['body']}",
+                title="Email Message Preview",
+                border_style="cyan",
+            )
+        )
+
+        # Pre-flight checklist table
+        chk = p["checks"]
+        tbl = Table(title="Pre-Flight Safety Checklist", box=box.ROUNDED)
+        tbl.add_column("Safety Gate Check", style="cyan")
+        tbl.add_column("Status", style="white")
+
+        tbl.add_row("Approved by User", "[green]✓ Ready[/green]" if chk["is_approved"] else "[yellow]✗ Needs Approval[/yellow]")
+        tbl.add_row("Quality Gate Audit", "[green]✓ Passed[/green]" if chk["quality_gate_passed"] else "[red]✗ Failed[/red]")
+        tbl.add_row(
+            "Suppression List",
+            "[green]✓ Clean[/green]"
+            if chk["recipient_not_suppressed"]
+            else f"[red]✗ Suppressed ({p['suppression_reason']})[/red]",
+        )
+        tbl.add_row("Duplicate Send Prevention", "[green]✓ Safe[/green]" if chk["no_duplicate_sent"] else "[red]✗ Recipient Already Emailed[/red]")
+        tbl.add_row(
+            "Daily Quota Allocation",
+            f"[green]✓ Available[/green] ({p['daily_sends_today']} / {p['daily_cap']} used)",
+        )
+        tbl.add_row("Emergency Kill Switch", "[green]✓ Inactive[/green]" if chk["kill_switch_inactive"] else "[red]✗ ACTIVE[/red]")
+        tbl.add_row(
+            "Dispatch Mode",
+            "[yellow]DRY RUN (Simulated)[/yellow]" if chk["dry_run_mode"] else "[red]LIVE GMAIL[/red]",
+        )
+
+        console.print(tbl)
+        if p["ready_to_send"]:
+            console.print("\n[green]✓ Message passes all safety checks and is ready to dispatch.[/green]")
+        else:
+            console.print("\n[yellow]Notice: Message is NOT yet ready for dispatch. Resolve outstanding checks first.[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error previewing message: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@outreach_group.command("approve")
+@click.argument("message_id", type=int)
+@click.option("--force", is_flag=True, help="Force approval even if Quality Gate noted review warnings")
+def outreach_approve_cmd(message_id: int, force: bool):
+    """Approve a draft message for outreach sending."""
+    conn = _get_conn()
+    try:
+        ok, msg = approve_message(conn, message_id, force=force)
+        if ok:
+            console.print(f"[green]✓ {msg}[/green]")
+        else:
+            console.print(f"[red]✗ {msg}[/red]")
+    finally:
+        conn.close()
+
+
+@outreach_group.command("queue")
+@click.option("--limit", type=int, default=None, help="Maximum approved messages to queue")
+@click.option("--service", type=str, default=None, help="Filter by service category")
+def outreach_queue_cmd(limit: int | None, service: str | None):
+    """Move approved messages into the outbound dispatch queue."""
+    conn = _get_conn()
+    try:
+        count = queue_messages(conn, limit=limit, service=service)
+        if count == 0:
+            console.print("[yellow]No approved messages found eligible for queueing.[/yellow]")
+            console.print("[dim]Run 'salesos outreach approve <ID>' first.[/dim]")
+        else:
+            console.print(f"[green]✓ Successfully moved {count} approved messages into the outreach queue.[/green]")
+    finally:
+        conn.close()
+
+
+@outreach_group.command("sync-drafts")
+@click.option("--message-id", type=int, default=None, help="Specific message ID to sync")
+@click.option("--live", is_flag=True, help="Sync directly to Gmail via Gmail API (default is dry-run)")
+def outreach_sync_drafts_cmd(message_id: int | None, live: bool):
+    """Synchronize queued drafts into Gmail Drafts for web review."""
+    conn = _get_conn()
+    try:
+        mids = [message_id] if message_id else None
+        res = sync_drafts_to_gmail(conn, message_ids=mids, dry_run=not live)
+
+        mode_str = "[red]LIVE GMAIL[/red]" if live else "[yellow]DRY RUN[/yellow]"
+        console.print(
+            Panel(
+                f"[bold]Mode:[/bold] {mode_str}\n"
+                f"[bold]Evaluated:[/bold] {res['total_evaluated']}\n"
+                f"[bold]Successfully Synced:[/bold] [green]{res['synced']}[/green]\n"
+                f"[bold]Skipped (Suppressed):[/bold] {res['skipped']}",
+                title="Draft Synchronization Results",
+                border_style="green" if not res["errors"] else "yellow",
+            )
+        )
+        if res["errors"]:
+            console.print("[red]Errors encountered:[/red]")
+            for err in res["errors"]:
+                console.print(f"  • {err}")
+    finally:
+        conn.close()
+
+
+@outreach_group.command("send")
+@click.argument("message_id", type=int, required=False)
+@click.option("--all-queued", is_flag=True, help="Send all currently queued messages in batch")
+@click.option("--limit", type=int, default=None, help="Batch size limit when sending queued")
+@click.option("--live", is_flag=True, help="Execute live send via Gmail API (default is dry-run)")
+@click.option("--force", is_flag=True, help="Bypass non-critical warnings")
+def outreach_send_cmd(
+    message_id: int | None,
+    all_queued: bool,
+    limit: int | None,
+    live: bool,
+    force: bool,
+):
+    """Send approved outreach messages with full safety and compliance checks."""
+    if not message_id and not all_queued:
+        console.print("[yellow]Please specify a MESSAGE_ID to send or use --all-queued to send the queue.[/yellow]")
+        return
+
+    conn = _get_conn()
+    try:
+        # Batch send
+        if all_queued:
+            res = send_batch(conn, limit=limit, dry_run=not live)
+            mode_str = "[red]LIVE GMAIL[/red]" if live else "[yellow]DRY RUN[/yellow]"
+            console.print(
+                Panel(
+                    f"[bold]Mode:[/bold] {mode_str}\n"
+                    f"[bold]Queued Found:[/bold] {res['total_queued']}\n"
+                    f"[bold]Sent Successfully:[/bold] [green]{res['sent']}[/green]\n"
+                    f"[bold]Skipped/Failed:[/bold] {res['skipped']}",
+                    title="Outreach Batch Send Results",
+                    border_style="green" if not res["errors"] else "yellow",
+                )
+            )
+            if res["errors"]:
+                for err in res["errors"]:
+                    console.print(f"  • [yellow]{err}[/yellow]")
+            return
+
+        # Single message send
+        res = send_outreach_message(conn, message_id=message_id, dry_run=not live, force=force)
+        mode_str = "[red]LIVE GMAIL[/red]" if live else "[yellow]DRY RUN[/yellow]"
+        console.print(
+            Panel(
+                f"[green]✓ Outreach message dispatched successfully[/green]\n\n"
+                f"[bold]Message ID:[/bold] {res['message_id']}\n"
+                f"[bold]Recipient:[/bold] {res['recipient']}\n"
+                f"[bold]Mode:[/bold] {mode_str}\n"
+                f"[bold]Gmail Message ID:[/bold] {res.get('gmail_message_id')}\n"
+                f"[bold]Daily Sends Used:[/bold] {res['daily_sends_today']}",
+                title="Dispatch Confirmation",
+                border_style="green",
+            )
+        )
+    except Exception as e:
+        console.print(f"[red]Dispatch blocked: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@outreach_group.command("suppress")
+@click.argument("email", type=str)
+@click.option(
+    "--reason",
+    default="manual",
+    type=click.Choice(["opt_out", "unsubscribe", "bounce", "complaint", "manual", "invalid"]),
+    help="Reason for suppression",
+)
+@click.option("--source", default="cli", help="Source recording the suppression")
+def outreach_suppress_cmd(email: str, reason: str, source: str):
+    """Add an email to the suppression list and cancel any pending messages."""
+    conn = _get_conn()
+    try:
+        res = record_suppression(conn, email=email, reason=reason, source=source)
+        console.print(
+            Panel(
+                f"[green]✓ Email successfully added to suppression list[/green]\n\n"
+                f"[bold]Normalized Email:[/bold] {res['email']}\n"
+                f"[bold]Reason:[/bold] {res['reason']}\n"
+                f"[bold]Source:[/bold] {res['source']}\n"
+                f"[bold]Cancelled Pending Messages:[/bold] [yellow]{res['cancelled_messages']}[/yellow]",
+                title="Suppression Recorded",
+                border_style="green",
+            )
+        )
+    except Exception as e:
+        console.print(f"[red]Failed to suppress email: {e}[/red]")
+    finally:
+        conn.close()
+
+
+@outreach_group.command("status")
+def outreach_status_cmd():
+    """Display outreach campaign metrics, queue status, and safety limits."""
+    conn = _get_conn()
+    try:
+        s = get_outreach_status(conn)
+
+        table = Table(title="NexAgentLab Outreach Campaign Overview", box=box.ROUNDED)
+        table.add_column("Metric / Status", style="cyan")
+        table.add_column("Count / Setting", style="white")
+
+        msg_counts = s["messages_by_status"]
+        table.add_row("Drafts in Review", str(msg_counts.get("draft", 0)))
+        table.add_row("Approved Messages", f"[green]{msg_counts.get('approved', 0)}[/green]")
+        table.add_row("Messages in Outbox Queue", f"[bold cyan]{msg_counts.get('queued', 0)}[/bold cyan]")
+        table.add_row("Successfully Sent", f"[bold green]{msg_counts.get('sent', 0)}[/bold green]")
+        table.add_row("Cancelled / Suppressed", str(msg_counts.get("cancelled", 0)))
+        table.add_row("Failed Dispatches", f"[red]{msg_counts.get('failed', 0)}[/red]" if msg_counts.get("failed") else "0")
+
+        table.add_section()
+        table.add_row(
+            "Today's Sent Volume",
+            f"{s['daily_sends_today']} / {s['daily_cap']} (Quota remaining: {s['quota_remaining']})",
+        )
+        table.add_row(
+            "Dispatch Mode",
+            "[yellow]DRY RUN (Safe - Simulation Only)[/yellow]"
+            if s["dry_run"]
+            else "[bold red]LIVE GMAIL[/bold red]",
+        )
+        table.add_row(
+            "Kill Switch",
+            "[bold red]ACTIVE (All outreach blocked)[/bold red]"
+            if s["kill_switch_active"]
+            else "[green]Inactive (Normal)[/green]",
+        )
+        table.add_row("Suppression List Size", f"{s['total_suppressed']} addresses")
+        table.add_row("Configured Agency Sender", s["configured_sender"])
+
+        console.print(table)
     finally:
         conn.close()
 

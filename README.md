@@ -9,7 +9,7 @@
 🟢 **Milestone 1** — Lead import, validation, deduplication, and CLI  
 🟢 **Milestone 2** — Research Agent & Opportunity Identification  
 🟢 **Milestone 3** — Lead Qualification, Service Matching & Personalization  
-⬜ Milestone 4 — Email integration (Gmail API)  
+🟢 **Milestone 4** — Gmail OAuth Integration & Controlled Outreach  
 ⬜ Milestone 5 — Reply management & sales pipeline  
 ⬜ Milestone 6 — Dashboard & campaign management  
 
@@ -120,12 +120,101 @@ salesos drafts export data\exports\outreach_drafts.csv
 salesos drafts export data\exports\outreach_drafts.json --format json
 ```
 
-### 7. Run Tests
+### 7. Gmail Integration & Authentication
+
+```powershell
+# Inspect Gmail OAuth status, token validity, and sender identity
+salesos gmail status
+
+# Authenticate with Google OAuth 2.0 (displays consent URL and prompts for auth code)
+salesos gmail auth
+
+# Authenticate with a provided authorization code directly
+salesos gmail auth --code YOUR_AUTH_CODE
+```
+
+### 8. Controlled Outreach & Safe Dispatch
+
+```powershell
+# Preview an outreach draft and inspect complete pre-flight checklist
+salesos outreach preview 1
+
+# Explicitly approve a draft message for outreach
+salesos outreach approve 1
+salesos outreach approve 1 --force
+
+# Queue all approved messages for outbound dispatch
+salesos outreach queue
+salesos outreach queue --limit 10 --service booking_system
+
+# Synchronize queued drafts into Gmail Drafts folder for web review (dry-run default)
+salesos outreach sync-drafts
+salesos outreach sync-drafts --live
+
+# Dispatch outreach message (DRY RUN by default — simulates send safely)
+salesos outreach send 1
+salesos outreach send --all-queued
+
+# Live sending (Requires explicit --live flag AND valid OAuth account match)
+salesos outreach send 1 --live
+salesos outreach send --all-queued --live
+
+# Add an email to central suppression (instantly cancels any pending outreach)
+salesos outreach suppress client@example.com --reason opt_out
+
+# View campaign outreach metrics, quota limits, and safety status
+salesos outreach status
+```
+
+### 9. Run Tests
 
 ```powershell
 pytest tests/ -v
-# Total tests: 114 passed
+# Total tests: 149 passed (100% pass rate, zero regressions)
 ```
+
+## Google Cloud OAuth Setup (Zero Paid Services)
+
+To authenticate your Gmail account (`nexagentlab.tech@gmail.com`) for draft synchronization or live sending:
+
+1. Open [Google Cloud Console](https://console.cloud.google.com).
+2. Create or select a project (e.g., `NexAgentLab SalesOS`).
+3. Navigate to **APIs & Services > Library**, search for **Gmail API**, and click **Enable**.
+4. Go to **APIs & Services > OAuth consent screen**:
+   - Choose User Type: **External**.
+   - Fill in App Name (`NexAgentLab SalesOS`) and User Support Email (`nexagentlab.tech@gmail.com`).
+   - Add Test User: `nexagentlab.tech@gmail.com`.
+5. Navigate to **APIs & Services > Credentials > Create Credentials > OAuth client ID**:
+   - Application type: **Desktop app**.
+   - Name: `SalesOS Local Client`.
+6. Download the generated JSON credentials file and save it as `credentials.json` in the project root (or configure `GMAIL_CREDENTIALS_FILE`).
+7. Run `salesos gmail auth`, open the provided URL in your browser, sign in with `nexagentlab.tech@gmail.com`, and provide the authorization code.
+
+Tokens are stored securely in `data/token.json` and are automatically refreshed. Secrets and tokens are never printed, committed, or leaked in logs.
+
+## Explicit Live-Send Activation Procedure
+
+By default, SalesOS operates in **DRY-RUN / DRAFT-ONLY** mode:
+1. All sends are simulated.
+2. `GMAIL_DRY_RUN=true` is the default.
+3. Drafts can be synced to your Gmail web interface using `salesos outreach sync-drafts --live` for visual human review before sending.
+
+To enable live email dispatch:
+1. Ensure your authorized account matches `nexagentlab.tech@gmail.com` via `salesos gmail status`.
+2. Inspect the draft and pre-flight checklist: `salesos outreach preview <ID>`.
+3. Approve the message: `salesos outreach approve <ID>`.
+4. Run live dispatch explicitly:
+   ```powershell
+   salesos outreach send <ID> --live
+   ```
+   Or set `GMAIL_DRY_RUN=false` in your `.env` file.
+
+### Emergency Kill Switch
+If you ever need to instantly halt all sending operations, set:
+```powershell
+$env:CAMPAIGN_KILL_SWITCH="true"
+```
+Or in `.env`: `CAMPAIGN_KILL_SWITCH=true`. All outreach commands will immediately refuse to send.
 
 ## Architecture
 
